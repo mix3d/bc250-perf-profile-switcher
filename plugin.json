@@ -1,0 +1,11 @@
+{
+  "name": "BC250 Performance Profiles",
+  "author": "mix3d",
+  "flags": ["_root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["bc250", "performance", "gpu"],
+    "description": "Set the BC-250 GPU max clock live via a notched slider, driving the cyan-skillfish governor.",
+    "image": ""
+  }
+}

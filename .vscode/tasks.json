@@ -1,0 +1,77 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "settingscheck",
+            "type": "shell",
+            "group": "none",
+            "detail": "Check that .vscode/settings.json has been created from defsettings.json",
+            "command": "${workspaceFolder}/.vscode/config.sh",
+            "problemMatcher": []
+        },
+        {
+            "label": "build",
+            "type": "shell",
+            "group": "build",
+            "detail": "Build plugin zip (no Docker required)",
+            "command": "${workspaceFolder}/build.sh",
+            "problemMatcher": []
+        },
+        {
+            "label": "copyzip",
+            "detail": "Deploy plugin zip to deck",
+            "type": "shell",
+            "group": "none",
+            "dependsOn": ["chmodplugins"],
+            "command": "rsync -azp --chmod=D0755,F0755 --rsh='ssh -p ${config:deckport} ${config:deckkey}' out/ ${config:deckuser}@${config:deckip}:${config:deckdir}/homebrew/plugins",
+            "problemMatcher": []
+        },
+        {
+            "label": "extractzip",
+            "detail": "Extract plugin zip on deck",
+            "type": "shell",
+            "group": "none",
+            "command": "ssh ${config:deckuser}@${config:deckip} -p ${config:deckport} ${config:deckkey} 'echo ${config:deckpass} | sudo -S mkdir -m 755 -p \"$(echo \"${config:deckdir}/homebrew/plugins/${config:pluginname}\" | sed \"s| |-|g\")\" && echo ${config:deckpass} | sudo -S chown ${config:deckuser}:${config:deckuser} \"$(echo \"${config:deckdir}/homebrew/plugins/${config:pluginname}\" | sed \"s| |-|g\")\" && echo ${config:deckpass} | sudo -S bsdtar -xzpf \"${config:deckdir}/homebrew/plugins/${config:pluginname}.zip\" -C \"$(echo \"${config:deckdir}/homebrew/plugins/${config:pluginname}\" | sed \"s| |-|g\")\" --strip-components=1 --fflags'",
+            "problemMatcher": []
+        },
+        {
+            "label": "deploy",
+            "dependsOrder": "sequence",
+            "group": "none",
+            "dependsOn": ["copyzip", "extractzip"],
+            "problemMatcher": []
+        },
+        {
+            "label": "builddeploy",
+            "detail": "Builds plugin and deploys to deck",
+            "dependsOrder": "sequence",
+            "group": "none",
+            "dependsOn": ["build", "deploy"],
+            "problemMatcher": []
+        },
+        {
+            "label": "updatefrontendlib",
+            "type": "shell",
+            "group": "build",
+            "detail": "Update @decky/ui",
+            "command": "pnpm update @decky/ui --latest",
+            "problemMatcher": []
+        },
+        {
+            "label": "chmodplugins",
+            "detail": "chmod plugins folder to prevent permission issues",
+            "type": "shell",
+            "group": "none",
+            "command": "ssh ${config:deckuser}@${config:deckip} -p ${config:deckport} ${config:deckkey} 'echo ${config:deckpass} | sudo -S chown ${config:deckuser} ${config:deckdir}/homebrew/plugins/'",
+            "problemMatcher": []
+        },
+        {
+            "label": "restartdecky",
+            "detail": "Restart Decky plugin loader",
+            "type": "shell",
+            "group": "none",
+            "command": "ssh ${config:deckuser}@${config:deckip} -p ${config:deckport} ${config:deckkey} 'echo ${config:deckpass} | sudo -S systemctl restart plugin_loader'",
+            "problemMatcher": []
+        }
+    ]
+}
