@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import json
 import os
 import shutil
@@ -150,11 +151,19 @@ class Plugin:
             else:
                 current_index = len(notches) - 1
 
+            cpu_max_mhz = None
+            try:
+                with open("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq") as f:
+                    cpu_max_mhz = int(f.read().strip()) // 1000
+            except Exception:
+                pass
+
             return {
                 "available": True,
                 "reason": None,
                 "notches": notches,
                 "current_index": current_index,
+                "cpu_max_mhz": cpu_max_mhz,
             }
         except Exception as e:
             decky.logger.error(f"get_status error: {e}")
@@ -207,6 +216,8 @@ class Plugin:
         cpu_temp_c = None
         gfx_clock_mhz = None
         cpu_clock_mhz = None
+        gpu_busy_pct = None
+        cpu_usage_pct = None
 
         try:
             hwmon_base = "/sys/class/hwmon"
@@ -267,72 +278,136 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"get_telemetry cpu_clock error: {e}")
 
+        try:
+            drm_base = "/sys/class/drm"
+            if os.path.isdir(drm_base):
+                for entry in sorted(os.listdir(drm_base)):
+                    if not entry.startswith("card") or "-" in entry:
+                        continue
+                    busy_file = os.path.join(drm_base, entry, "device", "gpu_busy_percent")
+                    try:
+                        with open(busy_file) as f:
+                            gpu_busy_pct = int(f.read().strip())
+                        break
+                    except Exception:
+                        pass
+        except Exception as e:
+            decky.logger.error(f"get_telemetry gpu_busy error: {e}")
+
+        try:
+            with open("/proc/stat") as f:
+                line = f.readline()
+            parts = line.split()
+            vals = [int(x) for x in parts[1:8]]  # user nice system idle iowait irq softirq
+            idle = vals[3] + vals[4]
+            total = sum(vals)
+            if hasattr(self, "_prev_cpu_stat"):
+                prev_total, prev_idle = self._prev_cpu_stat
+                d_total = total - prev_total
+                d_idle = idle - prev_idle
+                if d_total > 0:
+                    cpu_usage_pct = int(round((1 - d_idle / d_total) * 100))
+            self._prev_cpu_stat = (total, idle)
+        except Exception as e:
+            decky.logger.error(f"get_telemetry cpu_usage error: {e}")
+
         return {
             "gpu_temp_c": gpu_temp_c,
             "cpu_temp_c": cpu_temp_c,
             "gfx_clock_mhz": gfx_clock_mhz,
             "cpu_clock_mhz": cpu_clock_mhz,
+            "gpu_busy_pct": gpu_busy_pct,
+            "cpu_usage_pct": cpu_usage_pct,
         }
+
+    async def get_history(self) -> list:
+        return list(self._history)
+
+    async def set_history_enabled(self, enabled: bool) -> None:
+        if enabled:
+            if not self._poll_task or self._poll_task.done():
+                self._poll_task = asyncio.create_task(self._poll_telemetry())
+                decky.logger.info("history polling started")
+        else:
+            if self._poll_task and not self._poll_task.done():
+                self._poll_task.cancel()
+                try:
+                    await self._poll_task
+                except asyncio.CancelledError:
+                    pass
+                decky.logger.info("history polling stopped")
+
+    async def _poll_telemetry(self):
+        while True:
+            try:
+                t = await self.get_telemetry()
+                if any(v is not None for v in t.values()):
+                    self._history.append(t)
+            except Exception as e:
+                decky.logger.error(f"_poll_telemetry error: {e}")
+            await asyncio.sleep(2)
 
     async def _main(self):
         self._notches: list = []
+        self._history: collections.deque = collections.deque(maxlen=150)
+
         dep_error = _check_system_deps()
         if dep_error:
             decky.logger.error(f"_main: dependency check failed: {dep_error}")
-            return
+        else:
+            try:
+                self._notches = _derive_notches()
+                decky.logger.info(f"_main: loaded {len(self._notches)} notches: {self._notches}")
+            except FileNotFoundError:
+                decky.logger.info(f"_main: governor config not found at {GOVERNOR_CONFIG}, skipping load")
+            except Exception as e:
+                decky.logger.error(f"_main: failed to load notches: {e}")
 
-        try:
-            self._notches = _derive_notches()
-            decky.logger.info(f"_main: loaded {len(self._notches)} notches: {self._notches}")
-        except FileNotFoundError:
-            decky.logger.info(f"_main: governor config not found at {GOVERNOR_CONFIG}, skipping load")
-        except Exception as e:
-            decky.logger.error(f"_main: failed to load notches: {e}")
+            try:
+                available = await _is_governor_available()
+                if not available:
+                    decky.logger.info("_main: governor not available, skipping re-apply")
+                elif not self._notches:
+                    decky.logger.info("_main: no notches loaded, skipping re-apply")
+                else:
+                    persisted = _load_persisted()
+                    if persisted is None:
+                        decky.logger.info("_main: no persisted cap, using governor default")
+                    elif persisted not in self._notches:
+                        decky.logger.info(
+                            f"_main: persisted freq {persisted} no longer a valid notch "
+                            f"(valid: {self._notches}), skipping re-apply"
+                        )
+                    else:
+                        proc = await asyncio.create_subprocess_exec(
+                            "busctl", "--system", "call",
+                            GOVERNOR_SERVICE,
+                            GOVERNOR_OBJECT,
+                            GOVERNOR_IFACE,
+                            "SetRange",
+                            "uu", "0", str(persisted),
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.PIPE,
+                            env=_CLEAN_ENV,
+                        )
+                        _, stderr_bytes = await proc.communicate()
+                        if proc.returncode == 0:
+                            decky.logger.info(f"_main: re-applied persisted cap {persisted} MHz")
+                        else:
+                            stderr = stderr_bytes.decode(errors="replace").strip()
+                            decky.logger.error(f"_main: failed to re-apply cap: {stderr}")
+            except Exception as e:
+                decky.logger.error(f"_main error: {e}")
 
-        try:
-            available = await _is_governor_available()
-            if not available:
-                decky.logger.info("_main: governor not available, skipping re-apply")
-                return
-
-            if not self._notches:
-                decky.logger.info("_main: no notches loaded, skipping re-apply")
-                return
-
-            persisted = _load_persisted()
-            if persisted is None:
-                decky.logger.info("_main: no persisted cap, using governor default")
-                return
-
-            if persisted not in self._notches:
-                decky.logger.info(
-                    f"_main: persisted freq {persisted} no longer a valid notch "
-                    f"(valid: {self._notches}), skipping re-apply"
-                )
-                return
-
-            proc = await asyncio.create_subprocess_exec(
-                "busctl", "--system", "call",
-                GOVERNOR_SERVICE,
-                GOVERNOR_OBJECT,
-                GOVERNOR_IFACE,
-                "SetRange",
-                "uu", "0", str(persisted),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-                env=_CLEAN_ENV,
-            )
-            _, stderr_bytes = await proc.communicate()
-
-            if proc.returncode == 0:
-                decky.logger.info(f"_main: re-applied persisted cap {persisted} MHz")
-            else:
-                stderr = stderr_bytes.decode(errors="replace").strip()
-                decky.logger.error(f"_main: failed to re-apply cap: {stderr}")
-        except Exception as e:
-            decky.logger.error(f"_main error: {e}")
+        self._poll_task: asyncio.Task | None = None
 
     async def _unload(self):
+        if hasattr(self, "_poll_task") and self._poll_task:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
         decky.logger.info("BC250 Perf: unloading")
 
     async def _uninstall(self):
