@@ -116,6 +116,8 @@ def _save_persisted(freq_mhz: int) -> None:
         json.dump({"last_cap_mhz": freq_mhz}, f)
 
 
+
+
 class Plugin:
     async def get_status(self) -> dict:
         try:
@@ -151,19 +153,11 @@ class Plugin:
             else:
                 current_index = len(notches) - 1
 
-            cpu_max_mhz = None
-            try:
-                with open("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq") as f:
-                    cpu_max_mhz = int(f.read().strip()) // 1000
-            except Exception:
-                pass
-
             return {
                 "available": True,
                 "reason": None,
                 "notches": notches,
                 "current_index": current_index,
-                "cpu_max_mhz": cpu_max_mhz,
             }
         except Exception as e:
             decky.logger.error(f"get_status error: {e}")
@@ -216,7 +210,7 @@ class Plugin:
         cpu_temp_c = None
         gfx_clock_mhz = None
         cpu_clock_mhz = None
-        gpu_busy_pct = None
+        gpu_power_w = None
         cpu_usage_pct = None
 
         try:
@@ -241,8 +235,13 @@ class Plugin:
                                 gfx_clock_mhz = int(f.read().strip()) // 1_000_000
                         except Exception:
                             pass
+                        try:
+                            with open(os.path.join(hwmon_path, "power1_average")) as f:
+                                gpu_power_w = int(f.read().strip()) / 1_000_000
+                        except Exception:
+                            pass
 
-                    elif driver_name == "k10temp" and cpu_temp_c is None:
+                    if driver_name == "k10temp" and cpu_temp_c is None:
                         try:
                             with open(os.path.join(hwmon_path, "temp1_input")) as f:
                                 cpu_temp_c = int(f.read().strip()) / 1000.0
@@ -279,22 +278,6 @@ class Plugin:
             decky.logger.error(f"get_telemetry cpu_clock error: {e}")
 
         try:
-            drm_base = "/sys/class/drm"
-            if os.path.isdir(drm_base):
-                for entry in sorted(os.listdir(drm_base)):
-                    if not entry.startswith("card") or "-" in entry:
-                        continue
-                    busy_file = os.path.join(drm_base, entry, "device", "gpu_busy_percent")
-                    try:
-                        with open(busy_file) as f:
-                            gpu_busy_pct = int(f.read().strip())
-                        break
-                    except Exception:
-                        pass
-        except Exception as e:
-            decky.logger.error(f"get_telemetry gpu_busy error: {e}")
-
-        try:
             with open("/proc/stat") as f:
                 line = f.readline()
             parts = line.split()
@@ -316,7 +299,7 @@ class Plugin:
             "cpu_temp_c": cpu_temp_c,
             "gfx_clock_mhz": gfx_clock_mhz,
             "cpu_clock_mhz": cpu_clock_mhz,
-            "gpu_busy_pct": gpu_busy_pct,
+            "gpu_power_w": gpu_power_w,
             "cpu_usage_pct": cpu_usage_pct,
         }
 
@@ -345,7 +328,7 @@ class Plugin:
                     self._history.append(t)
             except Exception as e:
                 decky.logger.error(f"_poll_telemetry error: {e}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
     async def _main(self):
         self._notches: list = []

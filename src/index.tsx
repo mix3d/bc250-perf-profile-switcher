@@ -17,7 +17,6 @@ interface Status {
   reason: string | null;
   notches: number[];
   current_index: number;
-  cpu_max_mhz: number | null;
 }
 
 interface Telemetry {
@@ -25,13 +24,13 @@ interface Telemetry {
   cpu_temp_c: number | null;
   gfx_clock_mhz: number | null;
   cpu_clock_mhz: number | null;
-  gpu_busy_pct: number | null;
+  gpu_power_w: number | null;
   cpu_usage_pct: number | null;
 }
 
 type TelemetryKey = keyof Telemetry;
 
-const BUFFER_SIZE = 150; // 5 min at 2s polling
+const BUFFER_SIZE = 60; // 1 min at 1s polling
 
 const SPARK_HEIGHT = 40;
 
@@ -42,17 +41,53 @@ const getHistory = callable<[], Telemetry[]>("get_history");
 const setHistoryEnabled = callable<[boolean], void>("set_history_enabled");
 const getDebugInfo = callable<[], Record<string, string | number | null>>("get_debug_info");
 
-function Sparkline({ data, max, height = SPARK_HEIGHT }: { data: number[]; max: number; height?: number }) {
+const rowHead: React.CSSProperties = {
+  fontSize: "0.75em",
+  fontWeight: "bold",
+  textTransform: "uppercase",
+  letterSpacing: "0.06em",
+};
+
+const sectionHead = (mt: string): React.CSSProperties => ({
+  ...rowHead,
+  marginBottom: "4px",
+  marginTop: mt,
+});
+
+const dimLabel: React.CSSProperties = { fontSize: "0.75em", opacity: 0.55 };
+
+const metricLabel: React.CSSProperties = { ...dimLabel, width: "44px", flexShrink: 0 };
+
+const cellValue: React.CSSProperties = { fontSize: "0.85em" };
+
+const valueStyle: React.CSSProperties = { ...cellValue, whiteSpace: "nowrap", width: "64px", flexShrink: 0 };
+
+const graphContainer: React.CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  borderRadius: "4px",
+  overflow: "hidden",
+  backgroundImage:
+    "linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px)",
+  backgroundSize: "8px 8px",
+  backgroundColor: "rgba(0,0,0,0.2)",
+};
+
+function Sparkline({ data, height = SPARK_HEIGHT }: { data: number[]; height?: number }) {
   const W = 200;
   const H = height;
+  const PAD = 3;
   const step = W / (BUFFER_SIZE - 1);
   if (data.length < 2) {
     return <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: H, display: "block" }} />;
   }
+  const lo = Math.min(...data);
+  const hi = Math.max(...data);
+  const range = hi - lo || 1;
   const points = data
     .map((v, i) => {
       const x = W - (data.length - 1 - i) * step;
-      const y = H - Math.max(0, Math.min(1, v / max)) * (H - 1);
+      const y = PAD + ((hi - v) / range) * (H - 2 * PAD);
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     })
     .join(" ");
@@ -75,27 +110,17 @@ function Sparkline({ data, max, height = SPARK_HEIGHT }: { data: number[]; max: 
   );
 }
 
-function SparkRow({ label, data, max, value }: { label: string; data: number[]; max: number; value: string }) {
+function SparkRow({ label, data, value }: { label: string; data: number[]; value: string }) {
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "5px" }}>
-      <span style={{ fontSize: "0.72em", opacity: 0.65, width: "44px", flexShrink: 0 }}>{label}</span>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <Sparkline data={data} max={max} />
+    <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "4px" }}>
+      <span style={metricLabel}>{label}</span>
+      <span style={valueStyle}>{value}</span>
+      <div style={graphContainer}>
+        <Sparkline data={data} />
       </div>
-      <span style={{ fontSize: "0.8em", width: "72px", textAlign: "right", flexShrink: 0, whiteSpace: "nowrap" }}>{value}</span>
     </div>
   );
 }
-
-const sectionHeader = (marginTop: string): React.CSSProperties => ({
-  fontSize: "0.75em",
-  fontWeight: "bold",
-  textTransform: "uppercase",
-  letterSpacing: "0.06em",
-  opacity: 0.65,
-  marginBottom: "6px",
-  marginTop,
-});
 
 function Content() {
   const [loading, setLoading] = useState(true);
@@ -111,12 +136,13 @@ function Content() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const displayModeRef = useRef(displayMode);
   displayModeRef.current = displayMode;
+  const telemetryRef = useRef<Telemetry | null>(null);
   const bufferRef = useRef<Record<TelemetryKey, number[]>>({
     gfx_clock_mhz: [],
     gpu_temp_c: [],
     cpu_clock_mhz: [],
     cpu_temp_c: [],
-    gpu_busy_pct: [],
+    gpu_power_w: [],
     cpu_usage_pct: [],
   });
 
@@ -131,7 +157,24 @@ function Content() {
     });
   };
 
+  // Pad the left (oldest) side of each buffer with a flat line so the graph
+  // fills the full width when history is shorter than BUFFER_SIZE.
+  const padBuffer = (t: Telemetry) => {
+    const b = bufferRef.current;
+    (Object.keys(b) as TelemetryKey[]).forEach((key) => {
+      const val = t[key];
+      if (val == null) return;
+      if (b[key].length === 0) {
+        b[key] = Array(BUFFER_SIZE).fill(val);
+      } else if (b[key].length < BUFFER_SIZE) {
+        const padVal = b[key][0];
+        b[key] = [...Array(BUFFER_SIZE - b[key].length).fill(padVal), ...b[key]];
+      }
+    });
+  };
+
   const pushTelemetry = (t: Telemetry) => {
+    telemetryRef.current = t;
     if (displayModeRef.current === "histogram") pushToBuffer(t);
     setTelemetry(t);
   };
@@ -150,6 +193,7 @@ function Content() {
       await setHistoryEnabled(true);
       const history = await getHistory();
       history.forEach(pushToBuffer);
+      if (telemetryRef.current) padBuffer(telemetryRef.current);
     } else if (!isHistogram && wasHistogram) {
       clearBuffer();
       await setHistoryEnabled(false);
@@ -181,13 +225,16 @@ function Content() {
       }
 
       const t = await getTelemetry();
-      if (!cancelled) pushTelemetry(t);
+      if (!cancelled) {
+        pushTelemetry(t);
+        if (displayModeRef.current === "histogram") padBuffer(t);
+      }
 
       if (!cancelled) {
         pollRef.current = setInterval(async () => {
           const t = await getTelemetry();
           pushTelemetry(t);
-        }, 2000);
+        }, 1000);
       }
     })();
 
@@ -243,7 +290,7 @@ function Content() {
         {debug && (
           <PanelSection title="Debug">
             <PanelSectionRow>
-              <div style={{ fontSize: "0.75em", wordBreak: "break-all", opacity: 0.8 }}>
+              <div style={{ fontSize: "0.75em", wordBreak: "break-all", opacity: 0.55 }}>
                 {Object.entries(debug).map(([k, v]) => (
                   <div key={k}>
                     <b>{k}:</b> {String(v ?? "null")}
@@ -258,12 +305,10 @@ function Content() {
   }
 
   const currentMhz = status.notches[index] ?? 0;
-  const gpuMax = status.notches[status.notches.length - 1];
-  const cpuMax = status.cpu_max_mhz ?? 3600;
   const buf = bufferRef.current;
 
   const hasGpu = telemetry != null && (
-    telemetry.gfx_clock_mhz != null || telemetry.gpu_temp_c != null || telemetry.gpu_busy_pct != null
+    telemetry.gfx_clock_mhz != null || telemetry.gpu_temp_c != null || telemetry.gpu_power_w != null
   );
   const hasCpu = telemetry != null && (
     telemetry.cpu_clock_mhz != null || telemetry.cpu_temp_c != null || telemetry.cpu_usage_pct != null
@@ -287,6 +332,71 @@ function Content() {
 
       {(hasGpu || hasCpu) && (
         <PanelSection title="Status">
+          {displayMode === "minimal" && telemetry && (
+            <PanelSectionRow>
+              <div style={{
+                width: "100%",
+                display: "grid",
+                gridTemplateColumns: "30px 1fr 1fr 1fr",
+                rowGap: "5px",
+                columnGap: "4px",
+                alignItems: "center",
+              }}>
+                <div />
+                <div style={dimLabel}>MHz</div>
+                <div style={dimLabel}>Temp</div>
+                <div style={dimLabel}>Load</div>
+                {hasGpu && <>
+                  <div style={rowHead}>GPU</div>
+                  <div style={cellValue}>{telemetry.gfx_clock_mhz ?? "—"}</div>
+                  <div style={cellValue}>{telemetry.gpu_temp_c != null ? `${telemetry.gpu_temp_c.toFixed(0)}°` : "—"}</div>
+                  <div style={cellValue}>{telemetry.gpu_power_w != null ? `${telemetry.gpu_power_w.toFixed(1)}W` : "—"}</div>
+                </>}
+                {hasCpu && <>
+                  <div style={rowHead}>CPU</div>
+                  <div style={cellValue}>{telemetry.cpu_clock_mhz ?? "—"}</div>
+                  <div style={cellValue}>{telemetry.cpu_temp_c != null ? `${telemetry.cpu_temp_c.toFixed(0)}°` : "—"}</div>
+                  <div style={cellValue}>{telemetry.cpu_usage_pct != null ? `${telemetry.cpu_usage_pct}%` : "—"}</div>
+                </>}
+              </div>
+            </PanelSectionRow>
+          )}
+
+          {displayMode === "histogram" && telemetry && (
+            <PanelSectionRow>
+              <div style={{ width: "100%", display: "flex", flexDirection: "column" }}>
+                {hasGpu && (
+                  <>
+                    <div style={sectionHead("2px")}>GPU</div>
+                    {telemetry.gfx_clock_mhz != null && (
+                      <SparkRow label="Clock" data={buf.gfx_clock_mhz} value={`${telemetry.gfx_clock_mhz} MHz`} />
+                    )}
+                    {telemetry.gpu_temp_c != null && (
+                      <SparkRow label="Temp" data={buf.gpu_temp_c} value={`${telemetry.gpu_temp_c.toFixed(0)}°C`} />
+                    )}
+                    {telemetry.gpu_power_w != null && (
+                      <SparkRow label="Power" data={buf.gpu_power_w} value={`${telemetry.gpu_power_w.toFixed(1)} W`} />
+                    )}
+                  </>
+                )}
+                {hasCpu && (
+                  <>
+                    <div style={sectionHead(hasGpu ? "10px" : "2px")}>CPU</div>
+                    {telemetry.cpu_clock_mhz != null && (
+                      <SparkRow label="Clock" data={buf.cpu_clock_mhz} value={`${telemetry.cpu_clock_mhz} MHz`} />
+                    )}
+                    {telemetry.cpu_temp_c != null && (
+                      <SparkRow label="Temp" data={buf.cpu_temp_c} value={`${telemetry.cpu_temp_c.toFixed(0)}°C`} />
+                    )}
+                    {telemetry.cpu_usage_pct != null && (
+                      <SparkRow label="Usage" data={buf.cpu_usage_pct} value={`${telemetry.cpu_usage_pct}%`} />
+                    )}
+                  </>
+                )}
+              </div>
+            </PanelSectionRow>
+          )}
+
           <PanelSectionRow>
             <DropdownItem
               label="Display"
@@ -299,68 +409,6 @@ function Content() {
               onChange={(e) => { handleDisplayMode(e.data as DisplayMode); }}
             />
           </PanelSectionRow>
-
-          {displayMode === "minimal" && telemetry && (
-            <PanelSectionRow>
-              <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: "10px" }}>
-                {hasGpu && (
-                  <div>
-                    <div style={sectionHeader("0")}>GPU</div>
-                    <div style={{ display: "flex", gap: "16px", fontSize: "0.9em" }}>
-                      {telemetry.gfx_clock_mhz != null && <span>{telemetry.gfx_clock_mhz} MHz</span>}
-                      {telemetry.gpu_temp_c != null && <span>{telemetry.gpu_temp_c.toFixed(0)}°C</span>}
-                      {telemetry.gpu_busy_pct != null && <span>{telemetry.gpu_busy_pct}%</span>}
-                    </div>
-                  </div>
-                )}
-                {hasCpu && (
-                  <div>
-                    <div style={sectionHeader("0")}>CPU</div>
-                    <div style={{ display: "flex", gap: "16px", fontSize: "0.9em" }}>
-                      {telemetry.cpu_clock_mhz != null && <span>{telemetry.cpu_clock_mhz} MHz</span>}
-                      {telemetry.cpu_temp_c != null && <span>{telemetry.cpu_temp_c.toFixed(0)}°C</span>}
-                      {telemetry.cpu_usage_pct != null && <span>{telemetry.cpu_usage_pct}%</span>}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </PanelSectionRow>
-          )}
-
-          {displayMode === "histogram" && telemetry && (
-            <PanelSectionRow>
-              <div style={{ width: "100%", display: "flex", flexDirection: "column" }}>
-                {hasGpu && (
-                  <>
-                    <div style={sectionHeader("2px")}>GPU</div>
-                    {telemetry.gfx_clock_mhz != null && (
-                      <SparkRow label="Clock" data={buf.gfx_clock_mhz} max={gpuMax} value={`${telemetry.gfx_clock_mhz} MHz`} />
-                    )}
-                    {telemetry.gpu_temp_c != null && (
-                      <SparkRow label="Temp" data={buf.gpu_temp_c} max={100} value={`${telemetry.gpu_temp_c.toFixed(0)}°C`} />
-                    )}
-                    {telemetry.gpu_busy_pct != null && (
-                      <SparkRow label="Usage" data={buf.gpu_busy_pct} max={100} value={`${telemetry.gpu_busy_pct}%`} />
-                    )}
-                  </>
-                )}
-                {hasCpu && (
-                  <>
-                    <div style={sectionHeader(hasGpu ? "10px" : "2px")}>CPU</div>
-                    {telemetry.cpu_clock_mhz != null && (
-                      <SparkRow label="Clock" data={buf.cpu_clock_mhz} max={cpuMax} value={`${telemetry.cpu_clock_mhz} MHz`} />
-                    )}
-                    {telemetry.cpu_temp_c != null && (
-                      <SparkRow label="Temp" data={buf.cpu_temp_c} max={100} value={`${telemetry.cpu_temp_c.toFixed(0)}°C`} />
-                    )}
-                    {telemetry.cpu_usage_pct != null && (
-                      <SparkRow label="Usage" data={buf.cpu_usage_pct} max={100} value={`${telemetry.cpu_usage_pct}%`} />
-                    )}
-                  </>
-                )}
-              </div>
-            </PanelSectionRow>
-          )}
         </PanelSection>
       )}
     </>
