@@ -144,6 +144,8 @@ function Content() {
   const handleDisplayMode = async (mode: DisplayMode) => {
     const wasHistogram = displayModeRef.current === "histogram";
     const isHistogram = mode === "histogram";
+    setDisplayMode(mode);
+    localStorage.setItem("bc250_display_mode", mode);
     if (isHistogram && !wasHistogram) {
       await setHistoryEnabled(true);
       const history = await getHistory();
@@ -152,8 +154,6 @@ function Content() {
       clearBuffer();
       await setHistoryEnabled(false);
     }
-    setDisplayMode(mode);
-    localStorage.setItem("bc250_display_mode", mode);
   };
 
   useEffect(() => {
