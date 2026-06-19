@@ -9,6 +9,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -29,7 +31,16 @@ jobs:
       - name: Build
         run: bash build.sh
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bc250-power-v${{ steps.version.outputs.version }}
-          path: out/bc250-power.zip
+      - name: Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          if gh release view "v$VERSION" &>/dev/null; then
+            echo "Release v$VERSION already exists, skipping"
+          else
+            gh release create "v$VERSION" out/bc250-power.zip \
+              --title "v$VERSION" \
+              --generate-notes
+          fi
