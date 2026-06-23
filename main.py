@@ -3,19 +3,22 @@ import collections
 import json
 import os
 import shutil
+import time
 import tomllib
 
 import decky
 
 GOVERNOR_CONFIG = "/etc/cyan-skillfish-governor-smu/config.toml"
-GOVERNOR_SERVICE = "com.cyan.SkillFishGovernor"
-GOVERNOR_OBJECT = "/com/cyan/SkillFishGovernor"
-GOVERNOR_IFACE = "com.cyan.SkillFishGovernor.PerformanceMode"
+GOVERNOR_SERVICE = "com.cyanskillfish.Governor"
+GOVERNOR_OBJECT = "/com/cyanskillfish/Governor"
+GOVERNOR_IFACE = "com.cyanskillfish.Governor.PerformanceMode"
 
 # Decky Loader is a PyInstaller bundle that sets LD_LIBRARY_PATH to its temp
 # dir, which shadows system libraries. Strip it before spawning subprocesses so
 # busctl picks up the correct system libcrypto/libsystemd.
 _CLEAN_ENV = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
+
+_PROFILES_PATH = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "profiles.json")
 
 
 def _check_system_deps() -> str | None:
@@ -26,6 +29,14 @@ def _check_system_deps() -> str | None:
             "This plugin requires a systemd/D-Bus system (SteamOS or Arch-based)."
         )
     return None
+
+
+def _version_gte(version_str: str, min_tuple: tuple) -> bool:
+    try:
+        parts = tuple(int(x) for x in version_str.strip().split(".")[:3])
+        return parts >= min_tuple
+    except Exception:
+        return False
 
 
 def _derive_notches() -> list:
@@ -101,21 +112,17 @@ async def _get_debug_info() -> dict:
     return info
 
 
-def _load_persisted() -> int | None:
+def _load_profiles() -> dict:
     try:
-        path = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "state.json")
-        with open(path) as f:
-            return json.load(f).get("last_cap_mhz")
+        with open(_PROFILES_PATH) as f:
+            return json.load(f)
     except Exception:
-        return None
+        return {"profiles": [], "active_id": None}
 
 
-def _save_persisted(freq_mhz: int) -> None:
-    path = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "state.json")
-    with open(path, "w") as f:
-        json.dump({"last_cap_mhz": freq_mhz}, f)
-
-
+def _save_profiles(data: dict) -> None:
+    with open(_PROFILES_PATH, "w") as f:
+        json.dump(data, f)
 
 
 class Plugin:
@@ -134,8 +141,6 @@ class Plugin:
                     "current_index": 0,
                 }
 
-            # Refresh the notch cache on panel open — right time to pick up any
-            # config edits the user made in desktop mode before this session.
             notches = _derive_notches()
             self._notches = notches
 
@@ -147,11 +152,15 @@ class Plugin:
                     "current_index": 0,
                 }
 
-            persisted = _load_persisted()
-            if persisted is not None and persisted in notches:
-                current_index = notches.index(persisted)
-            else:
-                current_index = len(notches) - 1
+            profiles_data = _load_profiles()
+            active_id = profiles_data.get("active_id")
+            current_index = len(notches) - 1
+            if active_id:
+                active = next(
+                    (p for p in profiles_data.get("profiles", []) if p["id"] == active_id), None
+                )
+                if active and active.get("max_freq_mhz") in notches:
+                    current_index = notches.index(active["max_freq_mhz"])
 
             return {
                 "available": True,
@@ -171,6 +180,168 @@ class Plugin:
     async def get_debug_info(self) -> dict:
         return await _get_debug_info()
 
+    async def get_governor_version(self) -> dict:
+        bin_path = shutil.which("cyan-skillfish-governor-smu")
+        if not bin_path:
+            return {"version": None, "compatible": False}
+
+        # Get display version; strip leading 'v' (e.g. "v0.4.6" → "0.4.6")
+        version = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                bin_path, "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_CLEAN_ENV,
+            )
+            stdout, _ = await proc.communicate()
+            text = stdout.decode(errors="replace").strip()
+            # expected: "cyan-skillfish-governor-smu v0.4.6"
+            parts = text.split()
+            raw = parts[-1] if parts else None
+            version = raw.lstrip("v") if raw else None
+        except Exception as e:
+            decky.logger.error(f"get_governor_version binary check error: {e}")
+
+        # Check compatibility by introspecting for SetParameters on the live service.
+        # Returns None when the service isn't running so the frontend can defer to
+        # get_status() rather than showing a false version error.
+        compatible = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "busctl", "--system", "introspect",
+                GOVERNOR_SERVICE, GOVERNOR_OBJECT, GOVERNOR_IFACE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=_CLEAN_ENV,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                compatible = b"SetParameters" in stdout
+            # non-zero → service not running; leave compatible=None
+        except Exception as e:
+            decky.logger.error(f"get_governor_version introspect error: {e}")
+
+        return {"version": version, "compatible": compatible}
+
+    async def get_config_defaults(self) -> dict:
+        try:
+            with open(GOVERNOR_CONFIG, "rb") as f:
+                config = tomllib.load(f)
+            notches = self._notches if hasattr(self, "_notches") and self._notches else _derive_notches()
+            freq_range = config.get("frequency-range") or {}
+            load_target = config.get("load-target") or {}
+            temperature = config.get("temperature") or {}
+            return {
+                "min_freq_mhz": freq_range.get("min", 0),
+                "max_freq_mhz": freq_range.get("max", notches[-1] if notches else 0),
+                "load_min": load_target.get("lower", 0.5),
+                "load_max": load_target.get("upper", 0.65),
+                "temp_throttling": temperature.get("throttling", 85),
+                "temp_recovery": temperature.get("throttling_recovery", 75),
+            }
+        except Exception as e:
+            decky.logger.error(f"get_config_defaults error: {e}")
+            return {
+                "min_freq_mhz": 0,
+                "max_freq_mhz": 0,
+                "load_min": 0.5,
+                "load_max": 0.65,
+                "temp_throttling": 85,
+                "temp_recovery": 75,
+            }
+
+    async def list_profiles(self) -> dict:
+        return _load_profiles()
+
+    async def save_profile(self, profile: dict) -> dict:
+        try:
+            data = _load_profiles()
+            profiles = data.get("profiles", [])
+            if not profile.get("id"):
+                profile["id"] = str(int(time.time() * 1000))
+            existing_idx = next(
+                (i for i, p in enumerate(profiles) if p["id"] == profile["id"]), None
+            )
+            if existing_idx is not None:
+                profiles[existing_idx] = profile
+            else:
+                profiles.append(profile)
+            data["profiles"] = profiles
+            if not data.get("active_id"):
+                data["active_id"] = profile["id"]
+            _save_profiles(data)
+            return {"ok": True, "error": None, "id": profile["id"]}
+        except Exception as e:
+            decky.logger.error(f"save_profile error: {e}")
+            return {"ok": False, "error": str(e), "id": None}
+
+    async def delete_profile(self, profile_id: str) -> dict:
+        try:
+            data = _load_profiles()
+            data["profiles"] = [p for p in data.get("profiles", []) if p["id"] != profile_id]
+            if data.get("active_id") == profile_id:
+                remaining = data["profiles"]
+                data["active_id"] = remaining[0]["id"] if remaining else None
+            _save_profiles(data)
+            return {"ok": True, "error": None}
+        except Exception as e:
+            decky.logger.error(f"delete_profile error: {e}")
+            return {"ok": False, "error": str(e)}
+
+    async def set_active_profile(self, profile_id: str) -> dict:
+        try:
+            data = _load_profiles()
+            profile = next(
+                (p for p in data.get("profiles", []) if p["id"] == profile_id), None
+            )
+            if not profile:
+                return {"ok": False, "error": "Profile not found"}
+            data["active_id"] = profile_id
+            _save_profiles(data)
+            return await self._apply_profile(profile)
+        except Exception as e:
+            decky.logger.error(f"set_active_profile error: {e}")
+            return {"ok": False, "error": str(e)}
+
+    async def _apply_profile(self, profile: dict) -> dict:
+        min_freq = profile.get("min_freq_mhz", 0)
+        max_freq = profile.get("max_freq_mhz", 0)
+        load_min = float(profile.get("load_min", 0.5))
+        load_max = float(profile.get("load_max", 0.9))
+        throttle = profile.get("temp_throttling", 85)
+        recovery = profile.get("temp_recovery", 75)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "busctl", "--system", "call",
+                GOVERNOR_SERVICE,
+                GOVERNOR_OBJECT,
+                GOVERNOR_IFACE,
+                "SetParameters",
+                "uuffuu",
+                str(min_freq), str(max_freq),
+                str(load_min), str(load_max),
+                str(throttle), str(recovery),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_CLEAN_ENV,
+            )
+            _, stderr_bytes = await proc.communicate()
+            if proc.returncode == 0:
+                decky.logger.info(
+                    f"_apply_profile: applied '{profile.get('name')}' "
+                    f"({min_freq}-{max_freq} MHz, load {load_min}-{load_max}, "
+                    f"temp {throttle}/{recovery}°C)"
+                )
+                return {"ok": True, "error": None}
+            else:
+                stderr = stderr_bytes.decode(errors="replace").strip()
+                decky.logger.error(f"_apply_profile: busctl failed: {stderr}")
+                return {"ok": False, "error": stderr or f"busctl exited with code {proc.returncode}"}
+        except Exception as e:
+            decky.logger.error(f"_apply_profile error: {e}")
+            return {"ok": False, "error": str(e)}
+
     async def apply_cap(self, freq_mhz: int) -> dict:
         try:
             notches = self._notches
@@ -180,13 +351,27 @@ class Plugin:
                 decky.logger.error(f"apply_cap: invalid frequency {freq_mhz}, valid: {notches}")
                 return {"ok": False, "error": "Invalid frequency"}
 
+            data = _load_profiles()
+            active_id = data.get("active_id")
+            min_freq = 0
+
+            if active_id:
+                profiles = data.get("profiles", [])
+                for i, p in enumerate(profiles):
+                    if p["id"] == active_id:
+                        min_freq = p.get("min_freq_mhz", 0)
+                        profiles[i]["max_freq_mhz"] = freq_mhz
+                        break
+                data["profiles"] = profiles
+                _save_profiles(data)
+
             proc = await asyncio.create_subprocess_exec(
                 "busctl", "--system", "call",
                 GOVERNOR_SERVICE,
                 GOVERNOR_OBJECT,
                 GOVERNOR_IFACE,
                 "SetRange",
-                "uu", "0", str(freq_mhz),
+                "uu", str(min_freq), str(freq_mhz),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=_CLEAN_ENV,
@@ -194,8 +379,7 @@ class Plugin:
             _, stderr_bytes = await proc.communicate()
 
             if proc.returncode == 0:
-                _save_persisted(freq_mhz)
-                decky.logger.info(f"apply_cap: set max clock to {freq_mhz} MHz")
+                decky.logger.info(f"apply_cap: set range to {min_freq}-{freq_mhz} MHz")
                 return {"ok": True, "error": None}
             else:
                 stderr = stderr_bytes.decode(errors="replace").strip()
@@ -353,32 +537,35 @@ class Plugin:
                 elif not self._notches:
                     decky.logger.info("_main: no notches loaded, skipping re-apply")
                 else:
-                    persisted = _load_persisted()
-                    if persisted is None:
-                        decky.logger.info("_main: no persisted cap, using governor default")
-                    elif persisted not in self._notches:
-                        decky.logger.info(
-                            f"_main: persisted freq {persisted} no longer a valid notch "
-                            f"(valid: {self._notches}), skipping re-apply"
-                        )
+                    profiles_data = _load_profiles()
+
+                    # Auto-create a Default profile from TOML on first run
+                    if not profiles_data.get("profiles"):
+                        defaults = await self.get_config_defaults()
+                        default_profile = {
+                            "id": str(int(time.time() * 1000)),
+                            "name": "Default",
+                            **defaults,
+                        }
+                        profiles_data["profiles"] = [default_profile]
+                        profiles_data["active_id"] = default_profile["id"]
+                        _save_profiles(profiles_data)
+                        decky.logger.info("_main: created Default profile from TOML config")
+
+                    active_id = profiles_data.get("active_id")
+                    if not active_id:
+                        decky.logger.info("_main: no active profile, skipping re-apply")
                     else:
-                        proc = await asyncio.create_subprocess_exec(
-                            "busctl", "--system", "call",
-                            GOVERNOR_SERVICE,
-                            GOVERNOR_OBJECT,
-                            GOVERNOR_IFACE,
-                            "SetRange",
-                            "uu", "0", str(persisted),
-                            stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.PIPE,
-                            env=_CLEAN_ENV,
+                        active = next(
+                            (p for p in profiles_data.get("profiles", []) if p["id"] == active_id),
+                            None,
                         )
-                        _, stderr_bytes = await proc.communicate()
-                        if proc.returncode == 0:
-                            decky.logger.info(f"_main: re-applied persisted cap {persisted} MHz")
+                        if not active:
+                            decky.logger.info("_main: active profile not found in profiles list")
                         else:
-                            stderr = stderr_bytes.decode(errors="replace").strip()
-                            decky.logger.error(f"_main: failed to re-apply cap: {stderr}")
+                            result = await self._apply_profile(active)
+                            if not result["ok"]:
+                                decky.logger.error(f"_main: failed to re-apply profile: {result['error']}")
             except Exception as e:
                 decky.logger.error(f"_main error: {e}")
 

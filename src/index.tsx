@@ -1,14 +1,24 @@
 import {
+  ConfirmModal,
+  DialogBody,
+  DialogButton,
+  DialogButtonSecondary,
+  DialogFooter,
+  DialogHeader,
   DropdownItem,
+  ModalRoot,
   PanelSection,
   PanelSectionRow,
   SliderField,
   Spinner,
+  TextField,
+  ToggleField,
+  showModal,
   staticClasses,
 } from "@decky/ui";
 import { callable, definePlugin, toaster } from "@decky/api";
-import { useEffect, useRef, useState } from "react";
-import { FaBolt } from "react-icons/fa";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { FaBolt, FaPencilAlt } from "react-icons/fa";
 
 type DisplayMode = "off" | "minimal" | "histogram";
 
@@ -28,10 +38,29 @@ interface Telemetry {
   cpu_usage_pct: number | null;
 }
 
+interface Profile {
+  id: string;
+  name: string;
+  min_freq_mhz: number;
+  max_freq_mhz: number;
+  load_min: number;
+  load_max: number;
+  temp_throttling: number;
+  temp_recovery: number;
+}
+
+interface ConfigDefaults {
+  min_freq_mhz: number;
+  max_freq_mhz: number;
+  load_min: number;
+  load_max: number;
+  temp_throttling: number;
+  temp_recovery: number;
+}
+
 type TelemetryKey = keyof Telemetry;
 
-const BUFFER_SIZE = 60; // 1 min at 1s polling
-
+const BUFFER_SIZE = 60;
 const SPARK_HEIGHT = 40;
 
 const getStatus = callable<[], Status>("get_status");
@@ -40,6 +69,12 @@ const getTelemetry = callable<[], Telemetry>("get_telemetry");
 const getHistory = callable<[], Telemetry[]>("get_history");
 const setHistoryEnabled = callable<[boolean], void>("set_history_enabled");
 const getDebugInfo = callable<[], Record<string, string | number | null>>("get_debug_info");
+const getGovernorVersion = callable<[], { version: string | null; compatible: boolean | null }>("get_governor_version");
+const getConfigDefaults = callable<[], ConfigDefaults>("get_config_defaults");
+const listProfiles = callable<[], { profiles: Profile[]; active_id: string | null }>("list_profiles");
+const saveProfile = callable<[Profile], { ok: boolean; error: string | null; id: string | null }>("save_profile");
+const deleteProfile = callable<[string], { ok: boolean; error: string | null }>("delete_profile");
+const setActiveProfile = callable<[string], { ok: boolean; error: string | null }>("set_active_profile");
 
 const rowHead: React.CSSProperties = {
   fontSize: "0.75em",
@@ -122,6 +157,226 @@ function SparkRow({ label, data, value }: { label: string; data: number[]; value
   );
 }
 
+interface ProfileEditModalProps {
+  closeModal?: () => void;
+  profile: Profile | null;
+  notches: number[];
+  defaults: ConfigDefaults | null;
+  onSave: (p: Profile) => Promise<void>;
+  onDelete?: (id: string) => Promise<void>;
+}
+
+function ProfileEditModal({ closeModal, profile, notches, defaults, onSave, onDelete }: ProfileEditModalProps) {
+  const fiftyMhzSteps = useMemo(() => {
+    const lo = notches[0] ?? 0;
+    const hi = notches[notches.length - 1] ?? 0;
+    const steps: number[] = [];
+    for (let f = lo; f <= hi; f += 50) steps.push(f);
+    if (steps.length === 0 || steps[steps.length - 1] !== hi) steps.push(hi);
+    return steps;
+  }, [notches]);
+
+  const snapIdx = (mhz: number, freqs: number[]) =>
+    freqs.reduce((best, f, i) => Math.abs(f - mhz) < Math.abs(freqs[best] - mhz) ? i : best, 0);
+
+  const findNotchIdx = (mhz: number | undefined, fallback: number) => {
+    if (mhz == null) return Math.max(0, notches.indexOf(fallback));
+    const idx = notches.indexOf(mhz);
+    return idx >= 0 ? idx : notches.length - 1;
+  };
+
+  const [name, setName] = useState(profile?.name ?? "New Profile");
+  const [useTomlSteps, setUseTomlSteps] = useState(true);
+  const activeFreqs = useTomlSteps ? notches : fiftyMhzSteps;
+
+  const [minFreqIdx, setMinFreqIdx] = useState(() =>
+    findNotchIdx(profile?.min_freq_mhz, defaults?.min_freq_mhz ?? 0)
+  );
+  const [maxFreqIdx, setMaxFreqIdx] = useState(() =>
+    findNotchIdx(profile?.max_freq_mhz, defaults?.max_freq_mhz ?? notches[notches.length - 1])
+  );
+
+  const handleToggleSteps = (toml: boolean) => {
+    const currentMin = activeFreqs[minFreqIdx];
+    const currentMax = activeFreqs[maxFreqIdx];
+    const newFreqs = toml ? notches : fiftyMhzSteps;
+    setUseTomlSteps(toml);
+    setMinFreqIdx(snapIdx(currentMin, newFreqs));
+    setMaxFreqIdx(snapIdx(currentMax, newFreqs));
+  };
+  const [loadMin, setLoadMin] = useState(
+    Math.round((profile?.load_min ?? defaults?.load_min ?? 0.5) * 100)
+  );
+  const [loadMax, setLoadMax] = useState(
+    Math.round((profile?.load_max ?? defaults?.load_max ?? 0.65) * 100)
+  );
+  const [throttleTemp, setThrottleTemp] = useState(
+    profile?.temp_throttling ?? defaults?.temp_throttling ?? 85
+  );
+  const [recoveryTemp, setRecoveryTemp] = useState(
+    profile?.temp_recovery ?? defaults?.temp_recovery ?? 75
+  );
+
+  const isValid =
+    name.trim().length > 0 &&
+    minFreqIdx <= maxFreqIdx &&
+    loadMin <= loadMax &&
+    recoveryTemp < throttleTemp;
+
+  const handleMaxFreqIdx = (v: number) => {
+    setMaxFreqIdx(v);
+    if (minFreqIdx > v) setMinFreqIdx(v);
+  };
+  const handleMinFreqIdx = (v: number) => {
+    setMinFreqIdx(v);
+    if (maxFreqIdx < v) setMaxFreqIdx(v);
+  };
+  const handleLoadMax = (v: number) => {
+    setLoadMax(v);
+    if (loadMin > v) setLoadMin(v);
+  };
+  const handleLoadMin = (v: number) => {
+    setLoadMin(v);
+    if (loadMax < v) setLoadMax(v);
+  };
+  const handleThrottleTemp = (v: number) => {
+    setThrottleTemp(v);
+    if (recoveryTemp >= v) setRecoveryTemp(v - 1);
+  };
+  const handleRecoveryTemp = (v: number) => {
+    setRecoveryTemp(v);
+    if (throttleTemp <= v) setThrottleTemp(v + 1);
+  };
+
+  const handleSave = async () => {
+    const p: Profile = {
+      id: profile?.id ?? "",
+      name: name.trim(),
+      min_freq_mhz: activeFreqs[minFreqIdx],
+      max_freq_mhz: activeFreqs[maxFreqIdx],
+      load_min: loadMin / 100,
+      load_max: loadMax / 100,
+      temp_throttling: throttleTemp,
+      temp_recovery: recoveryTemp,
+    };
+    await onSave(p);
+    closeModal?.();
+  };
+
+  const minFreqLabel = activeFreqs[minFreqIdx] === 0 ? "Adaptive" : `${activeFreqs[minFreqIdx]} MHz`;
+
+  return (
+    <ModalRoot bAllowFullSize onCancel={closeModal}>
+      <DialogHeader>{profile ? "Edit Profile" : "New Profile"}</DialogHeader>
+      <DialogBody>
+        <TextField
+          label="Name"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+        />
+
+        <ToggleField
+          label="Use TOML safe-point steps"
+          checked={useTomlSteps}
+          onChange={handleToggleSteps}
+        />
+
+        <SliderField
+          label={`Min Freq: ${minFreqLabel}`}
+          value={minFreqIdx}
+          min={0}
+          max={activeFreqs.length - 1}
+          step={1}
+          onChange={handleMinFreqIdx}
+        />
+
+        <SliderField
+          label={`Max Freq: ${activeFreqs[maxFreqIdx]} MHz`}
+          value={maxFreqIdx}
+          min={0}
+          max={activeFreqs.length - 1}
+          step={1}
+          onChange={handleMaxFreqIdx}
+        />
+
+        <SliderField
+          label={`Load Min: ${loadMin}%`}
+          value={loadMin}
+          min={0}
+          max={100}
+          step={10}
+          onChange={handleLoadMin}
+        />
+
+        <SliderField
+          label={`Load Max: ${loadMax}%`}
+          value={loadMax}
+          min={0}
+          max={100}
+          step={10}
+          onChange={handleLoadMax}
+        />
+
+        <SliderField
+          label={`Throttle Temp: ${throttleTemp}°C`}
+          value={throttleTemp}
+          min={30}
+          max={110}
+          step={5}
+          onChange={handleThrottleTemp}
+        />
+
+        <SliderField
+          label={`Recovery Temp: ${recoveryTemp}°C`}
+          value={recoveryTemp}
+          min={30}
+          max={110}
+          step={5}
+          onChange={handleRecoveryTemp}
+        />
+
+        {!isValid && name.trim().length > 0 && (
+          <div style={{ color: "var(--field-negative-color, #e05c5c)", fontSize: "0.8em", marginTop: "8px" }}>
+            {minFreqIdx > maxFreqIdx && "Min freq must be ≤ max freq. "}
+            {loadMin > loadMax && "Load min must be ≤ load max. "}
+            {recoveryTemp >= throttleTemp && "Recovery temp must be < throttle temp."}
+          </div>
+        )}
+
+        {profile && onDelete && (
+          <div style={{ marginTop: "16px" }}>
+            <DialogButtonSecondary
+              style={{ color: "var(--field-negative-color, #e05c5c)", width: "100%" }}
+              onClick={() => {
+                showModal(
+                  <ConfirmModal
+                    strTitle="Delete Profile"
+                    strDescription={`Delete "${profile.name}"? This cannot be undone.`}
+                    onOK={async () => {
+                      await onDelete(profile.id);
+                      closeModal?.();
+                    }}
+                    strOKButtonText="Delete"
+                    bDestructiveWarning
+                  />
+                );
+              }}
+            >
+              Delete Profile
+            </DialogButtonSecondary>
+          </div>
+        )}
+      </DialogBody>
+      <DialogFooter>
+        <DialogButton disabled={!isValid} onClick={handleSave}>
+          Save
+        </DialogButton>
+        <DialogButton onClick={closeModal}>Cancel</DialogButton>
+      </DialogFooter>
+    </ModalRoot>
+  );
+}
+
 function Content() {
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState<Status | null>(null);
@@ -131,6 +386,10 @@ function Content() {
   const [displayMode, setDisplayMode] = useState<DisplayMode>(
     () => (localStorage.getItem("bc250_display_mode") as DisplayMode | null) ?? "minimal",
   );
+  const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
+  const [versionInfo, setVersionInfo] = useState<{ version: string | null; compatible: boolean | null } | null>(null);
+
   const appliedIndexRef = useRef(0);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -157,8 +416,6 @@ function Content() {
     });
   };
 
-  // Pad the left (oldest) side of each buffer with a flat line so the graph
-  // fills the full width when history is shorter than BUFFER_SIZE.
   const padBuffer = (t: Telemetry) => {
     const b = bufferRef.current;
     (Object.keys(b) as TelemetryKey[]).forEach((key) => {
@@ -200,16 +457,68 @@ function Content() {
     }
   };
 
+  const refreshProfiles = async () => {
+    const data = await listProfiles();
+    setProfiles(data.profiles);
+    setActiveProfileId(data.active_id);
+  };
+
+  const openEditModal = (profile: Profile | null, notches: number[], defaults: ConfigDefaults | null) => {
+    showModal(
+      <ProfileEditModal
+        profile={profile}
+        notches={notches}
+        defaults={defaults}
+        onSave={async (p) => {
+          const result = await saveProfile(p);
+          if (!result.ok) {
+            toaster.toast({ title: "BC250 Profiles", body: result.error ?? "Failed to save profile" });
+            return;
+          }
+          await refreshProfiles();
+          if (!p.id && result.id) {
+            // new profile — make it active and apply it
+            await setActiveProfile(result.id);
+            await refreshProfiles();
+          }
+        }}
+        onDelete={async (id) => {
+          const result = await deleteProfile(id);
+          if (!result.ok) {
+            toaster.toast({ title: "BC250 Profiles", body: result.error ?? "Failed to delete profile" });
+            return;
+          }
+          await refreshProfiles();
+        }}
+      />
+    );
+  };
+
   useEffect(() => {
     let cancelled = false;
 
     (async () => {
-      const s = await getStatus();
+      const [verInfo, s, profilesData] = await Promise.all([
+        getGovernorVersion(),
+        getStatus(),
+        listProfiles(),
+      ]);
       if (cancelled) return;
+
+      setVersionInfo(verInfo);
+
+      // compatible === false means service is running but lacks SetParameters (old governor)
+      // compatible === null means service not running — defer to getStatus() for the right error
+      if (verInfo.compatible === false) {
+        setLoading(false);
+        return;
+      }
 
       setStatus(s);
       setIndex(s.current_index);
       appliedIndexRef.current = s.current_index;
+      setProfiles(profilesData.profiles);
+      setActiveProfileId(profilesData.active_id);
       setLoading(false);
 
       if (!s.available) {
@@ -263,6 +572,9 @@ function Content() {
         setIndex(appliedIndexRef.current);
       } else {
         appliedIndexRef.current = newIndex;
+        // Refresh profiles state so the saved max_freq stays in sync
+        const data = await listProfiles();
+        setProfiles(data.profiles);
       }
     }, 300);
   };
@@ -272,6 +584,20 @@ function Content() {
       <PanelSection>
         <PanelSectionRow>
           <Spinner />
+        </PanelSectionRow>
+      </PanelSection>
+    );
+  }
+
+  // Version gate — blocks all UI only when service is running but SetParameters is absent
+  if (versionInfo && versionInfo.compatible === false) {
+    const msg = versionInfo.version == null
+      ? "cyan-skillfish-governor-smu not found — install the governor to use this plugin."
+      : `Governor v${versionInfo.version} is too old — v0.4.11+ required. Please update cyan-skillfish-governor-smu.`;
+    return (
+      <PanelSection title="Governor Required">
+        <PanelSectionRow>
+          <div style={{ color: "var(--field-negative-color, #e05c5c)" }}>{msg}</div>
         </PanelSectionRow>
       </PanelSection>
     );
@@ -304,6 +630,7 @@ function Content() {
     );
   }
 
+  const activeProfile = profiles.find((p) => p.id === activeProfileId) ?? null;
   const currentMhz = status.notches[index] ?? 0;
   const buf = bufferRef.current;
 
@@ -316,6 +643,54 @@ function Content() {
 
   return (
     <>
+      <PanelSection title="Profile">
+        <PanelSectionRow>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", width: "100%" }}>
+            <div style={{ flex: 1 }}>
+              <DropdownItem
+                label="Active"
+                rgOptions={[
+                  ...profiles.map((p) => ({ data: p.id, label: p.name })),
+                  { data: "__new__", label: "+ New profile…" },
+                ]}
+                selectedOption={activeProfileId ?? ""}
+                onChange={async (e) => {
+                  if (e.data === "__new__") {
+                    const defaults = await getConfigDefaults();
+                    openEditModal(null, status.notches, defaults);
+                    return;
+                  }
+                  const result = await setActiveProfile(e.data);
+                  if (!result.ok) {
+                    toaster.toast({ title: "BC250 Profiles", body: result.error ?? "Failed to switch profile" });
+                    return;
+                  }
+                  const switched = profiles.find((p) => p.id === e.data);
+                  if (switched) {
+                    const notchIdx = status.notches.indexOf(switched.max_freq_mhz);
+                    const newIdx = notchIdx >= 0 ? notchIdx : status.notches.length - 1;
+                    setIndex(newIdx);
+                    appliedIndexRef.current = newIdx;
+                  }
+                  setActiveProfileId(e.data);
+                }}
+              />
+            </div>
+            {activeProfile && (
+              <DialogButton
+                style={{ minWidth: 0, width: "36px", padding: "8px", flexShrink: 0 }}
+                onClick={async () => {
+                  const defaults = await getConfigDefaults();
+                  openEditModal(activeProfile, status.notches, defaults);
+                }}
+              >
+                <FaPencilAlt />
+              </DialogButton>
+            )}
+          </div>
+        </PanelSectionRow>
+      </PanelSection>
+
       <PanelSection title="GPU Max Clock">
         <PanelSectionRow>
           <SliderField
