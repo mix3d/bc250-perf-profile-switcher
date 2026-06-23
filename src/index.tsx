@@ -2,7 +2,10 @@ import {
   ConfirmModal,
   DialogBody,
   DialogButton,
+  DialogButtonPrimary,
   DialogButtonSecondary,
+  DialogControlsSection,
+  DialogControlsSectionHeader,
   DialogFooter,
   DialogHeader,
   DropdownItem,
@@ -18,7 +21,7 @@ import {
 } from "@decky/ui";
 import { callable, definePlugin, toaster } from "@decky/api";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { FaBolt, FaPencilAlt } from "react-icons/fa";
+import { FaBolt, FaPencilAlt, FaSave, FaTrash } from "react-icons/fa";
 
 type DisplayMode = "off" | "minimal" | "histogram";
 
@@ -269,71 +272,78 @@ function ProfileEditModal({ closeModal, profile, notches, defaults, onSave, onDe
     <ModalRoot bAllowFullSize onCancel={closeModal}>
       <DialogHeader>{profile ? "Edit Profile" : "New Profile"}</DialogHeader>
       <DialogBody>
-        <TextField
-          label="Name"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-        />
+        <DialogControlsSection>
+          <DialogControlsSectionHeader>Name</DialogControlsSectionHeader>
+          <TextField
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </DialogControlsSection>
 
-        <ToggleField
-          label="Use TOML safe-point steps"
-          checked={useTomlSteps}
-          onChange={handleToggleSteps}
-        />
+        <DialogControlsSection>
+          <DialogControlsSectionHeader>Frequency</DialogControlsSectionHeader>
+          <ToggleField
+            label="Use TOML safe-point steps"
+            checked={useTomlSteps}
+            onChange={handleToggleSteps}
+          />
+          <SliderField
+            label={`Min: ${minFreqLabel}`}
+            value={minFreqIdx}
+            min={0}
+            max={activeFreqs.length - 1}
+            step={1}
+            onChange={handleMinFreqIdx}
+          />
+          <SliderField
+            label={`Max: ${activeFreqs[maxFreqIdx]} MHz`}
+            value={maxFreqIdx}
+            min={0}
+            max={activeFreqs.length - 1}
+            step={1}
+            onChange={handleMaxFreqIdx}
+          />
+        </DialogControlsSection>
 
-        <SliderField
-          label={`Min Freq: ${minFreqLabel}`}
-          value={minFreqIdx}
-          min={0}
-          max={activeFreqs.length - 1}
-          step={1}
-          onChange={handleMinFreqIdx}
-        />
+        <DialogControlsSection>
+          <DialogControlsSectionHeader>Load Target</DialogControlsSectionHeader>
+          <SliderField
+            label={`Min: ${loadMin}%`}
+            value={loadMin}
+            min={0}
+            max={100}
+            step={10}
+            onChange={handleLoadMin}
+          />
+          <SliderField
+            label={`Max: ${loadMax}%`}
+            value={loadMax}
+            min={0}
+            max={100}
+            step={10}
+            onChange={handleLoadMax}
+          />
+        </DialogControlsSection>
 
-        <SliderField
-          label={`Max Freq: ${activeFreqs[maxFreqIdx]} MHz`}
-          value={maxFreqIdx}
-          min={0}
-          max={activeFreqs.length - 1}
-          step={1}
-          onChange={handleMaxFreqIdx}
-        />
-
-        <SliderField
-          label={`Load Min: ${loadMin}%`}
-          value={loadMin}
-          min={0}
-          max={100}
-          step={10}
-          onChange={handleLoadMin}
-        />
-
-        <SliderField
-          label={`Load Max: ${loadMax}%`}
-          value={loadMax}
-          min={0}
-          max={100}
-          step={10}
-          onChange={handleLoadMax}
-        />
-
-        <SliderField
-          label={`Throttle Temp: ${throttleTemp}°C`}
-          value={throttleTemp}
-          min={30}
-          max={110}
-          step={5}
-          onChange={handleThrottleTemp}
-        />
-
-        <SliderField
-          label={`Recovery Temp: ${recoveryTemp}°C`}
-          value={recoveryTemp}
-          min={30}
-          max={110}
-          step={5}
-          onChange={handleRecoveryTemp}
-        />
+        <DialogControlsSection>
+          <DialogControlsSectionHeader>Temperature</DialogControlsSectionHeader>
+          <SliderField
+            label={`Throttle: ${throttleTemp}°C`}
+            value={throttleTemp}
+            min={30}
+            max={110}
+            step={5}
+            onChange={handleThrottleTemp}
+          />
+          <SliderField
+            label={`Recovery: ${recoveryTemp}°C`}
+            value={recoveryTemp}
+            min={30}
+            max={110}
+            step={5}
+            onChange={handleRecoveryTemp}
+          />
+        </DialogControlsSection>
 
         {!isValid && name.trim().length > 0 && (
           <div style={{ color: "var(--field-negative-color, #e05c5c)", fontSize: "0.8em", marginTop: "8px" }}>
@@ -342,36 +352,35 @@ function ProfileEditModal({ closeModal, profile, notches, defaults, onSave, onDe
             {recoveryTemp >= throttleTemp && "Recovery temp must be < throttle temp."}
           </div>
         )}
-
-        {profile && onDelete && (
-          <div style={{ marginTop: "16px" }}>
-            <DialogButtonSecondary
-              style={{ color: "var(--field-negative-color, #e05c5c)", width: "100%" }}
-              onClick={() => {
-                showModal(
-                  <ConfirmModal
-                    strTitle="Delete Profile"
-                    strDescription={`Delete "${profile.name}"? This cannot be undone.`}
-                    onOK={async () => {
-                      await onDelete(profile.id);
-                      closeModal?.();
-                    }}
-                    strOKButtonText="Delete"
-                    bDestructiveWarning
-                  />
-                );
-              }}
-            >
-              Delete Profile
-            </DialogButtonSecondary>
-          </div>
-        )}
       </DialogBody>
       <DialogFooter>
-        <DialogButton disabled={!isValid} onClick={handleSave}>
-          Save
-        </DialogButton>
-        <DialogButton onClick={closeModal}>Cancel</DialogButton>
+        <div style={{ display: "flex", gap: "8px", width: "100%" }}>
+          <DialogButtonPrimary disabled={!isValid} onClick={handleSave}>
+            <FaSave style={{ verticalAlign: "middle", marginRight: "6px" }} /> Save
+          </DialogButtonPrimary>
+          <DialogButton onClick={closeModal}>Cancel</DialogButton>
+        </div>
+        {profile && onDelete && (
+          <DialogButtonSecondary
+            style={{ color: "var(--field-negative-color, #e05c5c)", width: "100%", marginTop: "8px" }}
+            onClick={() => {
+              showModal(
+                <ConfirmModal
+                  strTitle="Delete Profile"
+                  strDescription={`Delete "${profile.name}"? This cannot be undone.`}
+                  onOK={async () => {
+                    await onDelete(profile.id);
+                    closeModal?.();
+                  }}
+                  strOKButtonText="Delete"
+                  bDestructiveWarning
+                />
+              );
+            }}
+          >
+            <FaTrash style={{ verticalAlign: "middle", marginRight: "6px" }} /> Delete Profile
+          </DialogButtonSecondary>
+        )}
       </DialogFooter>
     </ModalRoot>
   );
