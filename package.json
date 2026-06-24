@@ -1,6 +1,6 @@
 {
   "name": "bc250-perf-profile-switcher",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Set the BC-250 GPU max clock live via a notched slider, driving the cyan-skillfish governor.",
   "type": "module",
   "scripts": {
