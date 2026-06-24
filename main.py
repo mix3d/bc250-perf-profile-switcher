@@ -1,8 +1,10 @@
 import asyncio
 import collections
+import glob
 import json
 import os
 import shutil
+import struct
 import time
 import tomllib
 
@@ -154,19 +156,19 @@ class Plugin:
 
             profiles_data = _load_profiles()
             active_id = profiles_data.get("active_id")
-            current_index = len(notches) - 1
+            current_freq_mhz = notches[-1]
             if active_id:
                 active = next(
                     (p for p in profiles_data.get("profiles", []) if p["id"] == active_id), None
                 )
-                if active and active.get("max_freq_mhz") in notches:
-                    current_index = notches.index(active["max_freq_mhz"])
+                if active:
+                    current_freq_mhz = active.get("cap_freq_mhz") or active.get("max_freq_mhz") or notches[-1]
 
             return {
                 "available": True,
                 "reason": None,
                 "notches": notches,
-                "current_index": current_index,
+                "current_freq_mhz": current_freq_mhz,
             }
         except Exception as e:
             decky.logger.error(f"get_status error: {e}")
@@ -347,9 +349,9 @@ class Plugin:
             notches = self._notches
             if not notches:
                 return {"ok": False, "error": "Notch list not loaded; open the plugin panel first."}
-            if freq_mhz not in notches:
-                decky.logger.error(f"apply_cap: invalid frequency {freq_mhz}, valid: {notches}")
-                return {"ok": False, "error": "Invalid frequency"}
+            if freq_mhz < notches[0] or freq_mhz > notches[-1]:
+                decky.logger.error(f"apply_cap: frequency {freq_mhz} out of range [{notches[0]}, {notches[-1]}]")
+                return {"ok": False, "error": "Frequency out of range"}
 
             data = _load_profiles()
             active_id = data.get("active_id")
@@ -360,7 +362,7 @@ class Plugin:
                 for i, p in enumerate(profiles):
                     if p["id"] == active_id:
                         min_freq = p.get("min_freq_mhz", 0)
-                        profiles[i]["max_freq_mhz"] = freq_mhz
+                        profiles[i]["cap_freq_mhz"] = freq_mhz
                         break
                 data["profiles"] = profiles
                 _save_profiles(data)
@@ -395,6 +397,7 @@ class Plugin:
         gfx_clock_mhz = None
         cpu_clock_mhz = None
         gpu_power_w = None
+        gpu_load_pct = None
         cpu_usage_pct = None
 
         try:
@@ -433,6 +436,22 @@ class Plugin:
                             pass
         except Exception as e:
             decky.logger.error(f"get_telemetry error: {e}")
+
+        try:
+            for metrics_path in glob.glob("/sys/class/drm/card*/device/gpu_metrics"):
+                with open(metrics_path, "rb") as f:
+                    data = f.read()
+                if len(data) < 30 or data[2] != 2:
+                    continue
+                def _field(o):
+                    v = struct.unpack_from("<H", data, o)[0]
+                    return None if v == 0xFFFF else v
+                raw = _field(28)
+                if raw is not None:
+                    gpu_load_pct = round(raw / 100.0)
+                break
+        except Exception as e:
+            decky.logger.error(f"get_telemetry gpu_metrics error: {e}")
 
         try:
             cpu_base = "/sys/devices/system/cpu"
@@ -484,6 +503,7 @@ class Plugin:
             "gfx_clock_mhz": gfx_clock_mhz,
             "cpu_clock_mhz": cpu_clock_mhz,
             "gpu_power_w": gpu_power_w,
+            "gpu_load_pct": gpu_load_pct,
             "cpu_usage_pct": cpu_usage_pct,
         }
 

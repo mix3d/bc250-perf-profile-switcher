@@ -29,7 +29,7 @@ interface Status {
   available: boolean;
   reason: string | null;
   notches: number[];
-  current_index: number;
+  current_freq_mhz: number;
 }
 
 interface Telemetry {
@@ -38,6 +38,7 @@ interface Telemetry {
   gfx_clock_mhz: number | null;
   cpu_clock_mhz: number | null;
   gpu_power_w: number | null;
+  gpu_load_pct: number | null;
   cpu_usage_pct: number | null;
 }
 
@@ -50,6 +51,8 @@ interface Profile {
   load_max: number;
   temp_throttling: number;
   temp_recovery: number;
+  use_toml_steps?: boolean;
+  cap_freq_mhz?: number;
 }
 
 interface ConfigDefaults {
@@ -261,6 +264,7 @@ function ProfileEditModal({ closeModal, profile, notches, defaults, onSave, onDe
       load_max: loadMax / 100,
       temp_throttling: throttleTemp,
       temp_recovery: recoveryTemp,
+      use_toml_steps: useTomlSteps,
     };
     await onSave(p);
     closeModal?.();
@@ -386,6 +390,24 @@ function ProfileEditModal({ closeModal, profile, notches, defaults, onSave, onDe
   );
 }
 
+function snapToEffective(freq: number, effective: number[]): number {
+  if (!effective.length) return 0;
+  return effective.reduce((best, f, i) =>
+    Math.abs(f - freq) < Math.abs(effective[best] - freq) ? i : best, 0);
+}
+
+function computeEffectiveNotches(profile: Profile | null, allNotches: number[]): number[] {
+  if (!profile) return allNotches;
+  const { min_freq_mhz, max_freq_mhz, use_toml_steps } = profile;
+  if (use_toml_steps !== false) {
+    return allNotches.filter((f) => f >= min_freq_mhz && f <= max_freq_mhz);
+  }
+  const steps: number[] = [];
+  for (let f = min_freq_mhz; f <= max_freq_mhz; f += 50) steps.push(f);
+  if (!steps.length || steps[steps.length - 1] !== max_freq_mhz) steps.push(max_freq_mhz);
+  return steps;
+}
+
 function Content() {
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState<Status | null>(null);
@@ -411,8 +433,18 @@ function Content() {
     cpu_clock_mhz: [],
     cpu_temp_c: [],
     gpu_power_w: [],
+    gpu_load_pct: [],
     cpu_usage_pct: [],
   });
+
+  const activeProfile = useMemo(
+    () => profiles.find((p) => p.id === activeProfileId) ?? null,
+    [profiles, activeProfileId]
+  );
+  const effectiveNotches = useMemo(
+    () => (status ? computeEffectiveNotches(activeProfile, status.notches) : []),
+    [status, activeProfile]
+  );
 
   const pushToBuffer = (t: Telemetry) => {
     const b = bufferRef.current;
@@ -524,8 +556,11 @@ function Content() {
       }
 
       setStatus(s);
-      setIndex(s.current_index);
-      appliedIndexRef.current = s.current_index;
+      const initProfile = profilesData.profiles.find((p: Profile) => p.id === profilesData.active_id) ?? null;
+      const initEffective = computeEffectiveNotches(initProfile, s.notches);
+      const initIdx = snapToEffective(s.current_freq_mhz, initEffective);
+      setIndex(initIdx);
+      appliedIndexRef.current = initIdx;
       setProfiles(profilesData.profiles);
       setActiveProfileId(profilesData.active_id);
       setLoading(false);
@@ -574,14 +609,13 @@ function Content() {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(async () => {
       if (!status) return;
-      const freq = status.notches[newIndex];
+      const freq = effectiveNotches[newIndex];
       const result = await applyCap(freq);
       if (!result.ok) {
         toaster.toast({ title: "BC250 Profiles", body: result.error ?? "Failed to apply cap" });
         setIndex(appliedIndexRef.current);
       } else {
         appliedIndexRef.current = newIndex;
-        // Refresh profiles state so the saved max_freq stays in sync
         const data = await listProfiles();
         setProfiles(data.profiles);
       }
@@ -639,12 +673,11 @@ function Content() {
     );
   }
 
-  const activeProfile = profiles.find((p) => p.id === activeProfileId) ?? null;
-  const currentMhz = status.notches[index] ?? 0;
+  const currentMhz = effectiveNotches[index] ?? 0;
   const buf = bufferRef.current;
 
   const hasGpu = telemetry != null && (
-    telemetry.gfx_clock_mhz != null || telemetry.gpu_temp_c != null || telemetry.gpu_power_w != null
+    telemetry.gfx_clock_mhz != null || telemetry.gpu_temp_c != null || telemetry.gpu_load_pct != null
   );
   const hasCpu = telemetry != null && (
     telemetry.cpu_clock_mhz != null || telemetry.cpu_temp_c != null || telemetry.cpu_usage_pct != null
@@ -676,8 +709,9 @@ function Content() {
                   }
                   const switched = profiles.find((p) => p.id === e.data);
                   if (switched) {
-                    const notchIdx = status.notches.indexOf(switched.max_freq_mhz);
-                    const newIdx = notchIdx >= 0 ? notchIdx : status.notches.length - 1;
+                    const newEffective = computeEffectiveNotches(switched, status.notches);
+                    const targetFreq = switched.cap_freq_mhz ?? switched.max_freq_mhz;
+                    const newIdx = snapToEffective(targetFreq, newEffective);
                     setIndex(newIdx);
                     appliedIndexRef.current = newIdx;
                   }
@@ -706,9 +740,9 @@ function Content() {
             label={`${currentMhz} MHz`}
             value={index}
             min={0}
-            max={status.notches.length - 1}
+            max={effectiveNotches.length - 1}
             step={1}
-            notchCount={status.notches.length}
+            notchCount={activeProfile?.use_toml_steps !== false ? effectiveNotches.length : undefined}
             onChange={handleChange}
           />
         </PanelSectionRow>
@@ -721,26 +755,26 @@ function Content() {
               <div style={{
                 width: "100%",
                 display: "grid",
-                gridTemplateColumns: "30px 1fr 1fr 1fr",
+                gridTemplateColumns: "auto 1fr 1fr 1fr",
                 rowGap: "5px",
-                columnGap: "4px",
+                columnGap: "10px",
                 alignItems: "center",
               }}>
                 <div />
-                <div style={dimLabel}>MHz</div>
-                <div style={dimLabel}>Temp</div>
-                <div style={dimLabel}>Load</div>
+                <div style={{ ...dimLabel, textAlign: "right" }}>MHz</div>
+                <div style={{ ...dimLabel, textAlign: "right" }}>Temp</div>
+                <div style={{ ...dimLabel, textAlign: "right" }}>Load</div>
                 {hasGpu && <>
                   <div style={rowHead}>GPU</div>
-                  <div style={cellValue}>{telemetry.gfx_clock_mhz ?? "—"}</div>
-                  <div style={cellValue}>{telemetry.gpu_temp_c != null ? `${telemetry.gpu_temp_c.toFixed(0)}°` : "—"}</div>
-                  <div style={cellValue}>{telemetry.gpu_power_w != null ? `${telemetry.gpu_power_w.toFixed(1)}W` : "—"}</div>
+                  <div style={{ ...cellValue, textAlign: "right" }}>{telemetry.gfx_clock_mhz ?? "—"}</div>
+                  <div style={{ ...cellValue, textAlign: "right" }}>{telemetry.gpu_temp_c != null ? `${telemetry.gpu_temp_c.toFixed(0)}°` : "—"}</div>
+                  <div style={{ ...cellValue, textAlign: "right" }}>{telemetry.gpu_load_pct != null ? `${telemetry.gpu_load_pct}%` : "—"}</div>
                 </>}
                 {hasCpu && <>
                   <div style={rowHead}>CPU</div>
-                  <div style={cellValue}>{telemetry.cpu_clock_mhz ?? "—"}</div>
-                  <div style={cellValue}>{telemetry.cpu_temp_c != null ? `${telemetry.cpu_temp_c.toFixed(0)}°` : "—"}</div>
-                  <div style={cellValue}>{telemetry.cpu_usage_pct != null ? `${telemetry.cpu_usage_pct}%` : "—"}</div>
+                  <div style={{ ...cellValue, textAlign: "right" }}>{telemetry.cpu_clock_mhz ?? "—"}</div>
+                  <div style={{ ...cellValue, textAlign: "right" }}>{telemetry.cpu_temp_c != null ? `${telemetry.cpu_temp_c.toFixed(0)}°` : "—"}</div>
+                  <div style={{ ...cellValue, textAlign: "right" }}>{telemetry.cpu_usage_pct != null ? `${telemetry.cpu_usage_pct}%` : "—"}</div>
                 </>}
               </div>
             </PanelSectionRow>
@@ -758,8 +792,8 @@ function Content() {
                     {telemetry.gpu_temp_c != null && (
                       <SparkRow label="Temp" data={buf.gpu_temp_c} value={`${telemetry.gpu_temp_c.toFixed(0)}°C`} />
                     )}
-                    {telemetry.gpu_power_w != null && (
-                      <SparkRow label="Power" data={buf.gpu_power_w} value={`${telemetry.gpu_power_w.toFixed(1)} W`} />
+                    {telemetry.gpu_load_pct != null && (
+                      <SparkRow label="Load" data={buf.gpu_load_pct} value={`${telemetry.gpu_load_pct}%`} />
                     )}
                   </>
                 )}
