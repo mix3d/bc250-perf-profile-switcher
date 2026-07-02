@@ -76,7 +76,18 @@ const getHistory = callable<[], Telemetry[]>("get_history");
 const setHistoryEnabled = callable<[boolean], void>("set_history_enabled");
 const getDebugInfo = callable<[], Record<string, string | number | null>>("get_debug_info");
 type GovernorStatus = "compatible" | "not_installed" | "outdated" | "stale_service" | "dbus_disabled" | "config_unreadable" | "unknown";
-const getGovernorVersion = callable<[], { version: string | null; status: GovernorStatus; min_version: string; config_path: string }>("get_governor_version");
+type VersionInfo = { version: string | null; status: GovernorStatus; min_version: string; config_path: string };
+const getGovernorVersion = callable<[], VersionInfo>("get_governor_version");
+
+// Every non-"compatible", non-"unknown" status blocks the UI with its own message —
+// TypeScript enforces that every such status is covered here.
+const GOVERNOR_STATUS_MESSAGES: Record<Exclude<GovernorStatus, "compatible" | "unknown">, (v: VersionInfo) => string> = {
+  not_installed: () => "cyan-skillfish-governor-smu not found — install the governor to use this plugin.",
+  outdated: (v) => `Governor v${v.version} is too old — v${v.min_version}+ required. Please update cyan-skillfish-governor-smu.`,
+  stale_service: (v) => `Governor v${v.version} is installed but the running service is still on an older version — restart cyan-skillfish-governor-smu to apply it.`,
+  dbus_disabled: () => "Governor D-Bus interface is disabled. Set dbus.enabled = true in the governor config and restart cyan-skillfish-governor-smu.",
+  config_unreadable: (v) => `Could not read the governor config at ${v.config_path} — check that it exists and is readable. Nothing in this plugin can work reliably until that's fixed.`,
+};
 const getConfigDefaults = callable<[], ConfigDefaults>("get_config_defaults");
 const listProfiles = callable<[], { profiles: Profile[]; active_id: string | null; corrupt: boolean }>("list_profiles");
 const resetProfiles = callable<[], { ok: boolean; error: string | null }>("reset_profiles");
@@ -176,17 +187,10 @@ interface ProfileEditModalProps {
 }
 
 function ProfileEditModal({ closeModal, profile, notches, defaults, onSave, onDelete }: ProfileEditModalProps) {
-  const fiftyMhzSteps = useMemo(() => {
-    const lo = notches[0] ?? 0;
-    const hi = notches[notches.length - 1] ?? 0;
-    const steps: number[] = [];
-    for (let f = lo; f <= hi; f += 50) steps.push(f);
-    if (steps.length === 0 || steps[steps.length - 1] !== hi) steps.push(hi);
-    return steps;
-  }, [notches]);
-
-  const snapIdx = (mhz: number, freqs: number[]) =>
-    freqs.reduce((best, f, i) => Math.abs(f - mhz) < Math.abs(freqs[best] - mhz) ? i : best, 0);
+  const fiftyMhzSteps = useMemo(
+    () => generate50MhzSteps(notches[0] ?? 0, notches[notches.length - 1] ?? 0),
+    [notches]
+  );
 
   const findNotchIdx = (mhz: number | undefined, fallback: number) => {
     if (mhz == null) return Math.max(0, notches.indexOf(fallback));
@@ -210,8 +214,8 @@ function ProfileEditModal({ closeModal, profile, notches, defaults, onSave, onDe
     const currentMax = activeFreqs[maxFreqIdx];
     const newFreqs = toml ? notches : fiftyMhzSteps;
     setUseTomlSteps(toml);
-    setMinFreqIdx(snapIdx(currentMin, newFreqs));
-    setMaxFreqIdx(snapIdx(currentMax, newFreqs));
+    setMinFreqIdx(snapToEffective(currentMin, newFreqs));
+    setMaxFreqIdx(snapToEffective(currentMax, newFreqs));
   };
   const [loadMin, setLoadMin] = useState(
     Math.round((profile?.load_min ?? defaults?.load_min ?? 0.5) * 100)
@@ -399,16 +403,20 @@ function snapToEffective(freq: number, effective: number[]): number {
     Math.abs(f - freq) < Math.abs(effective[best] - freq) ? i : best, 0);
 }
 
+function generate50MhzSteps(lo: number, hi: number): number[] {
+  const steps: number[] = [];
+  for (let f = lo; f <= hi; f += 50) steps.push(f);
+  if (!steps.length || steps[steps.length - 1] !== hi) steps.push(hi);
+  return steps;
+}
+
 function computeEffectiveNotches(profile: Profile | null, allNotches: number[]): number[] {
   if (!profile) return allNotches;
   const { min_freq_mhz, max_freq_mhz, use_toml_steps } = profile;
   if (use_toml_steps !== false) {
     return allNotches.filter((f) => f >= min_freq_mhz && f <= max_freq_mhz);
   }
-  const steps: number[] = [];
-  for (let f = min_freq_mhz; f <= max_freq_mhz; f += 50) steps.push(f);
-  if (!steps.length || steps[steps.length - 1] !== max_freq_mhz) steps.push(max_freq_mhz);
-  return steps;
+  return generate50MhzSteps(min_freq_mhz, max_freq_mhz);
 }
 
 function Content() {
@@ -422,7 +430,7 @@ function Content() {
   );
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
-  const [versionInfo, setVersionInfo] = useState<{ version: string | null; status: GovernorStatus; min_version: string; config_path: string } | null>(null);
+  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [latestVersion, setLatestVersion] = useState<string | null>(null);
   const [updating, setUpdating] = useState(false);
   const [profilesCorrupt, setProfilesCorrupt] = useState(false);
@@ -682,15 +690,7 @@ function Content() {
 
   // Version gate — blocks all UI unless the governor is installed and compatible
   if (versionInfo && versionInfo.status !== "compatible" && versionInfo.status !== "unknown") {
-    const msg = versionInfo.status === "not_installed"
-      ? "cyan-skillfish-governor-smu not found — install the governor to use this plugin."
-      : versionInfo.status === "stale_service"
-      ? `Governor v${versionInfo.version} is installed but the running service is still on an older version — restart cyan-skillfish-governor-smu to apply it.`
-      : versionInfo.status === "dbus_disabled"
-      ? "Governor D-Bus interface is disabled. Set dbus.enabled = true in the governor config and restart cyan-skillfish-governor-smu."
-      : versionInfo.status === "config_unreadable"
-      ? `Could not read the governor config at ${versionInfo.config_path} — check that it exists and is readable. Nothing in this plugin can work reliably until that's fixed.`
-      : `Governor v${versionInfo.version} is too old — v${versionInfo.min_version}+ required. Please update cyan-skillfish-governor-smu.`;
+    const msg = GOVERNOR_STATUS_MESSAGES[versionInfo.status](versionInfo);
     return (
       <PanelSection title="Governor Required">
         <PanelSectionRow>

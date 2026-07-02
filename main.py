@@ -29,6 +29,38 @@ _CLEAN_ENV = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
 _PROFILES_PATH = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "profiles.json")
 
 
+async def _run(*cmd: str) -> tuple[int, bytes, bytes]:
+    """Spawn a subprocess and collect its result. Single point for every
+    busctl/curl/systemd-run/binary invocation in this file."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=_CLEAN_ENV,
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode, stdout, stderr
+
+
+async def _call_governor_method(method: str, signature: str, *args: str) -> dict:
+    """Call a method on the governor's D-Bus interface, normalized into the
+    {"ok", "error"} shape used by every RPC method that mutates governor state."""
+    try:
+        returncode, _, stderr = await _run(
+            "busctl", "--system", "call",
+            GOVERNOR_SERVICE, GOVERNOR_OBJECT, GOVERNOR_IFACE,
+            method, signature, *args,
+        )
+        if returncode == 0:
+            return {"ok": True, "error": None}
+        stderr_text = stderr.decode(errors="replace").strip()
+        decky.logger.error(f"_call_governor_method: {method} failed: {stderr_text}")
+        return {"ok": False, "error": stderr_text or f"busctl exited with code {returncode}"}
+    except Exception as e:
+        decky.logger.error(f"_call_governor_method: {method} error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
 def _check_system_deps() -> str | None:
     """Return an actionable error string if a hard dependency is missing, else None."""
     if shutil.which("busctl") is None:
@@ -37,6 +69,18 @@ def _check_system_deps() -> str | None:
             "This plugin requires a systemd/D-Bus system (SteamOS or Arch-based)."
         )
     return None
+
+
+def _read_numeric(path: str, transform=int):
+    """Read a single-value sysfs file and apply a transform. Returns None on
+    any failure (missing file, bad permissions, unexpected content) — each
+    caller reads independently, so one missing metric must not affect others
+    (see get_telemetry)."""
+    try:
+        with open(path) as f:
+            return transform(f.read().strip())
+    except Exception:
+        return None
 
 
 def _version_gte(version_str: str, min_tuple: tuple) -> bool:
@@ -99,14 +143,8 @@ def _get_unavailable_reason() -> str:
 
 async def _is_governor_available() -> bool:
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "busctl", "--system", "status", GOVERNOR_SERVICE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=_CLEAN_ENV,
-        )
-        await proc.wait()
-        return proc.returncode == 0
+        returncode, _, _ = await _run("busctl", "--system", "status", GOVERNOR_SERVICE)
+        return returncode == 0
     except Exception:
         return False
 
@@ -115,14 +153,8 @@ async def _get_debug_info() -> dict:
     info: dict = {}
     info["busctl_path"] = shutil.which("busctl")
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "busctl", "--system", "status", GOVERNOR_SERVICE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_CLEAN_ENV,
-        )
-        stdout, stderr = await proc.communicate()
-        info["busctl_exit"] = proc.returncode
+        returncode, stdout, stderr = await _run("busctl", "--system", "status", GOVERNOR_SERVICE)
+        info["busctl_exit"] = returncode
         info["busctl_stdout"] = stdout.decode(errors="replace").strip()[:300]
         info["busctl_stderr"] = stderr.decode(errors="replace").strip()[:300]
     except Exception as e:
@@ -161,6 +193,12 @@ def _save_profiles(data: dict) -> None:
 
 
 class Plugin:
+    def _get_notches(self) -> list:
+        # Use the notches cached at startup so that any transient changes to
+        # the governor's live range (e.g. a cap applied last session) don't
+        # truncate the available notch list.
+        return self._notches if hasattr(self, "_notches") and self._notches else _derive_notches()
+
     async def get_status(self) -> dict:
         try:
             dep_error = _check_system_deps()
@@ -176,10 +214,7 @@ class Plugin:
                     "current_index": 0,
                 }
 
-            # Use the notches cached at startup so that any transient changes
-            # to the governor's live range (e.g. a cap applied last session)
-            # don't truncate the available notch list.
-            notches = self._notches if hasattr(self, "_notches") and self._notches else _derive_notches()
+            notches = self._get_notches()
 
             if not notches:
                 return {
@@ -242,16 +277,10 @@ class Plugin:
                 f"plugins_dir={plugins_dir}"
             )
 
-            proc = await asyncio.create_subprocess_exec(
-                "curl", "-fsSL", "-o", script_path, script_url,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_CLEAN_ENV,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
+            returncode, stdout, stderr = await _run("curl", "-fsSL", "-o", script_path, script_url)
+            if returncode != 0:
                 decky.logger.error(
-                    f"update_plugin: failed to fetch installer (exit {proc.returncode}): "
+                    f"update_plugin: failed to fetch installer (exit {returncode}): "
                     f"stdout={stdout} stderr={stderr}"
                 )
                 return {"started": False, "error": "Failed to download installer script"}
@@ -264,16 +293,10 @@ class Plugin:
                 "/bin/bash", script_path, plugins_dir,
             ]
             decky.logger.info(f"update_plugin: launching {cmd}")
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_CLEAN_ENV,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
+            returncode, stdout, stderr = await _run(*cmd)
+            if returncode != 0:
                 decky.logger.error(
-                    f"update_plugin: systemd-run failed (exit {proc.returncode}): "
+                    f"update_plugin: systemd-run failed (exit {returncode}): "
                     f"stdout={stdout} stderr={stderr}"
                 )
                 return {"started": False, "error": "Failed to start update"}
@@ -296,13 +319,7 @@ class Plugin:
         # Get display version; strip leading 'v' (e.g. "v0.4.6" → "0.4.6")
         version = None
         try:
-            proc = await asyncio.create_subprocess_exec(
-                bin_path, "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_CLEAN_ENV,
-            )
-            stdout, _ = await proc.communicate()
+            _, stdout, _ = await _run(bin_path, "--version")
             text = stdout.decode(errors="replace").strip()
             # expected: "cyan-skillfish-governor-smu v0.4.6"
             parts = text.split()
@@ -334,15 +351,10 @@ class Plugin:
 
         confirmed = False
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "busctl", "--system", "introspect",
-                GOVERNOR_SERVICE, GOVERNOR_OBJECT, GOVERNOR_IFACE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-                env=_CLEAN_ENV,
+            returncode, stdout, _ = await _run(
+                "busctl", "--system", "introspect", GOVERNOR_SERVICE, GOVERNOR_OBJECT, GOVERNOR_IFACE
             )
-            stdout, _ = await proc.communicate()
-            confirmed = proc.returncode == 0 and b"SetParameters" in stdout
+            confirmed = returncode == 0 and b"SetParameters" in stdout
         except Exception as e:
             decky.logger.error(f"get_governor_version introspect error: {e}")
 
@@ -367,7 +379,7 @@ class Plugin:
     async def get_config_defaults(self) -> dict:
         try:
             config = _load_governor_config()
-            notches = self._notches if hasattr(self, "_notches") and self._notches else _derive_notches()
+            notches = self._get_notches()
             freq_range = config.get("frequency-range") or {}
             load_target = config.get("load-target") or {}
             temperature = config.get("temperature") or {}
@@ -466,36 +478,17 @@ class Plugin:
         load_max = float(profile.get("load_max", 0.9))
         throttle = profile.get("temp_throttling", 85)
         recovery = profile.get("temp_recovery", 75)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "busctl", "--system", "call",
-                GOVERNOR_SERVICE,
-                GOVERNOR_OBJECT,
-                GOVERNOR_IFACE,
-                "SetParameters",
-                "uuffuu",
-                str(min_freq), str(max_freq),
-                str(load_min), str(load_max),
-                str(throttle), str(recovery),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_CLEAN_ENV,
+        result = await _call_governor_method(
+            "SetParameters", "uuffuu",
+            str(min_freq), str(max_freq), str(load_min), str(load_max), str(throttle), str(recovery),
+        )
+        if result["ok"]:
+            decky.logger.info(
+                f"_apply_profile: applied '{profile.get('name')}' "
+                f"({min_freq}-{max_freq} MHz, load {load_min}-{load_max}, "
+                f"temp {throttle}/{recovery}°C)"
             )
-            _, stderr_bytes = await proc.communicate()
-            if proc.returncode == 0:
-                decky.logger.info(
-                    f"_apply_profile: applied '{profile.get('name')}' "
-                    f"({min_freq}-{max_freq} MHz, load {load_min}-{load_max}, "
-                    f"temp {throttle}/{recovery}°C)"
-                )
-                return {"ok": True, "error": None}
-            else:
-                stderr = stderr_bytes.decode(errors="replace").strip()
-                decky.logger.error(f"_apply_profile: busctl failed: {stderr}")
-                return {"ok": False, "error": stderr or f"busctl exited with code {proc.returncode}"}
-        except Exception as e:
-            decky.logger.error(f"_apply_profile error: {e}")
-            return {"ok": False, "error": str(e)}
+        return result
 
     async def apply_cap(self, freq_mhz: int) -> dict:
         try:
@@ -520,26 +513,10 @@ class Plugin:
                 data["profiles"] = profiles
                 _save_profiles(data)
 
-            proc = await asyncio.create_subprocess_exec(
-                "busctl", "--system", "call",
-                GOVERNOR_SERVICE,
-                GOVERNOR_OBJECT,
-                GOVERNOR_IFACE,
-                "SetRange",
-                "uu", str(min_freq), str(freq_mhz),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_CLEAN_ENV,
-            )
-            _, stderr_bytes = await proc.communicate()
-
-            if proc.returncode == 0:
+            result = await _call_governor_method("SetRange", "uu", str(min_freq), str(freq_mhz))
+            if result["ok"]:
                 decky.logger.info(f"apply_cap: set range to {min_freq}-{freq_mhz} MHz")
-                return {"ok": True, "error": None}
-            else:
-                stderr = stderr_bytes.decode(errors="replace").strip()
-                decky.logger.error(f"apply_cap: busctl failed (exit {proc.returncode}): {stderr}")
-                return {"ok": False, "error": stderr or f"busctl exited with code {proc.returncode}"}
+            return result
         except Exception as e:
             decky.logger.error(f"apply_cap error: {e}")
             return {"ok": False, "error": str(e)}
@@ -565,28 +542,12 @@ class Plugin:
                         continue
 
                     if driver_name == "amdgpu" and gpu_temp_c is None:
-                        try:
-                            with open(os.path.join(hwmon_path, "temp1_input")) as f:
-                                gpu_temp_c = int(f.read().strip()) / 1000.0
-                        except Exception:
-                            pass
-                        try:
-                            with open(os.path.join(hwmon_path, "freq1_input")) as f:
-                                gfx_clock_mhz = int(f.read().strip()) // 1_000_000
-                        except Exception:
-                            pass
-                        try:
-                            with open(os.path.join(hwmon_path, "power1_average")) as f:
-                                gpu_power_w = int(f.read().strip()) / 1_000_000
-                        except Exception:
-                            pass
+                        gpu_temp_c = _read_numeric(os.path.join(hwmon_path, "temp1_input"), lambda s: int(s) / 1000.0)
+                        gfx_clock_mhz = _read_numeric(os.path.join(hwmon_path, "freq1_input"), lambda s: int(s) // 1_000_000)
+                        gpu_power_w = _read_numeric(os.path.join(hwmon_path, "power1_average"), lambda s: int(s) / 1_000_000)
 
                     if driver_name == "k10temp" and cpu_temp_c is None:
-                        try:
-                            with open(os.path.join(hwmon_path, "temp1_input")) as f:
-                                cpu_temp_c = int(f.read().strip()) / 1000.0
-                        except Exception:
-                            pass
+                        cpu_temp_c = _read_numeric(os.path.join(hwmon_path, "temp1_input"), lambda s: int(s) / 1000.0)
         except Exception as e:
             decky.logger.error(f"get_telemetry error: {e}")
 
@@ -613,12 +574,10 @@ class Plugin:
                 for cpu in os.listdir(cpu_base):
                     for fname in ("scaling_cur_freq", "cpuinfo_cur_freq"):
                         freq_file = os.path.join(cpu_base, cpu, "cpufreq", fname)
-                        try:
-                            with open(freq_file) as f:
-                                freqs.append(int(f.read().strip()))
+                        val = _read_numeric(freq_file)
+                        if val is not None:
+                            freqs.append(val)
                             break
-                        except Exception:
-                            pass
             if freqs:
                 cpu_clock_mhz = max(freqs) // 1000
             else:
