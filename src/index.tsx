@@ -292,7 +292,7 @@ function ProfileEditModal({ closeModal, profile, notches, defaults, onSave, onDe
         </DialogControlsSection>
 
         <DialogControlsSection>
-          <DialogControlsSectionHeader>Frequency</DialogControlsSectionHeader>
+          <DialogControlsSectionHeader>GPU Frequency</DialogControlsSectionHeader>
           <ToggleField
             label="Use TOML safe-point steps"
             checked={useTomlSteps}
@@ -397,6 +397,20 @@ function ProfileEditModal({ closeModal, profile, notches, defaults, onSave, onDe
   );
 }
 
+function parseVersion(v: string): [number, number, number] {
+  const parts = v.replace(/^v/, "").split(".").map((p) => parseInt(p, 10) || 0);
+  return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0];
+}
+
+function isNewerVersion(candidate: string, current: string): boolean {
+  const c = parseVersion(candidate);
+  const cur = parseVersion(current);
+  for (let i = 0; i < 3; i++) {
+    if (c[i] !== cur[i]) return c[i] > cur[i];
+  }
+  return false;
+}
+
 function snapToEffective(freq: number, effective: number[]): number {
   if (!effective.length) return 0;
   return effective.reduce((best, f, i) =>
@@ -436,7 +450,7 @@ function Content() {
   const [profilesCorrupt, setProfilesCorrupt] = useState(false);
   const [resettingProfiles, setResettingProfiles] = useState(false);
 
-  const updateAvailable = latestVersion !== null && latestVersion !== `v${__PLUGIN_VERSION__}`;
+  const updateAvailable = latestVersion !== null && isNewerVersion(latestVersion, __PLUGIN_VERSION__);
 
   const handleUpdate = async () => {
     setUpdating(true);
