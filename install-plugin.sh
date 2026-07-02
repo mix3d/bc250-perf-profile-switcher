@@ -22,4 +22,4 @@ unzip -o "$ZIP_PATH" -d /home/$SUDO_USER/homebrew/plugins/
 systemctl start plugin_loader.service
 echo -e "\n✅ Plugin loader restarted"
 
-echo -e "\n\U0001F5D1 Zip file deleted"
+echo -e "\n\U0001F5D1  Zip file deleted"
