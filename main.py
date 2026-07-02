@@ -15,6 +15,12 @@ GOVERNOR_SERVICE = "com.cyanskillfish.Governor"
 GOVERNOR_OBJECT = "/com/cyanskillfish/Governor"
 GOVERNOR_IFACE = "com.cyanskillfish.Governor.PerformanceMode"
 
+# Lowest governor release known to expose the SetParameters D-Bus method.
+# Informational only — actual compatibility is feature-detected at runtime
+# (see get_governor_version), since the running service can lag behind the
+# on-disk binary's --version output.
+MIN_GOVERNOR_VERSION = "0.4.11"
+
 # Decky Loader is a PyInstaller bundle that sets LD_LIBRARY_PATH to its temp
 # dir, which shadows system libraries. Strip it before spawning subprocesses so
 # busctl picks up the correct system libcrypto/libsystemd.
@@ -42,8 +48,7 @@ def _version_gte(version_str: str, min_tuple: tuple) -> bool:
 
 
 def _derive_notches() -> list:
-    with open(GOVERNOR_CONFIG, "rb") as f:
-        config = tomllib.load(f)
+    config = _load_governor_config()
 
     safe_points = sorted(sp["frequency"] for sp in config.get("safe-points", []))
 
@@ -56,12 +61,31 @@ def _derive_notches() -> list:
     ))
 
 
+def _load_governor_config() -> dict:
+    with open(GOVERNOR_CONFIG, "rb") as f:
+        return tomllib.load(f)
+
+
+def _dbus_enabled_in_config() -> bool | None:
+    """Read dbus.enabled from the governor config. A missing [dbus] section or
+    a missing enabled key is treated as disabled, not enabled — an absent
+    section means the interface was never turned on, same as enabled = false.
+    Returns None if the config can't be read at all — that's a distinct
+    failure, not evidence either way, so callers must not treat it as
+    "enabled" or "disabled"."""
+    try:
+        config = _load_governor_config()
+    except Exception as e:
+        decky.logger.error(f"_dbus_enabled_in_config config read error: {e}")
+        return None
+    return bool(config.get("dbus", {}).get("enabled", False))
+
+
 def _get_unavailable_reason() -> str:
     """Diagnose why the governor D-Bus service is not available."""
     try:
-        with open(GOVERNOR_CONFIG, "rb") as f:
-            config = tomllib.load(f)
-        if not config.get("dbus", {}).get("enabled", True):
+        config = _load_governor_config()
+        if not config.get("dbus", {}).get("enabled", False):
             return (
                 "Governor D-Bus interface is disabled. "
                 "Set dbus.enabled = true in the governor config and restart the service."
@@ -104,8 +128,7 @@ async def _get_debug_info() -> dict:
     except Exception as e:
         info["busctl_exception"] = str(e)
     try:
-        with open(GOVERNOR_CONFIG, "rb") as f:
-            tomllib.load(f)
+        _load_governor_config()
         info["config"] = "ok"
     except FileNotFoundError:
         info["config"] = "not found"
@@ -115,16 +138,26 @@ async def _get_debug_info() -> dict:
 
 
 def _load_profiles() -> dict:
+    """Raises on anything other than a missing file — a corrupt/unreadable
+    profiles.json must never be silently treated as "no profiles yet", since
+    every write path loads-then-saves and would pave over it."""
     try:
         with open(_PROFILES_PATH) as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
         return {"profiles": [], "active_id": None}
 
 
 def _save_profiles(data: dict) -> None:
-    with open(_PROFILES_PATH, "w") as f:
+    # Write-then-rename so a write interrupted mid-way (crash, power loss)
+    # can never leave profiles.json truncated — os.replace is an atomic
+    # rename, so readers always see either the old file or the new one.
+    tmp_path = _PROFILES_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, _PROFILES_PATH)
 
 
 class Plugin:
@@ -258,7 +291,7 @@ class Plugin:
     async def get_governor_version(self) -> dict:
         bin_path = shutil.which("cyan-skillfish-governor-smu")
         if not bin_path:
-            return {"version": None, "compatible": False}
+            return {"version": None, "status": "not_installed", "min_version": MIN_GOVERNOR_VERSION, "config_path": GOVERNOR_CONFIG}
 
         # Get display version; strip leading 'v' (e.g. "v0.4.6" → "0.4.6")
         version = None
@@ -278,10 +311,28 @@ class Plugin:
         except Exception as e:
             decky.logger.error(f"get_governor_version binary check error: {e}")
 
-        # Check compatibility by introspecting for SetParameters on the live service.
-        # Returns None when the service isn't running so the frontend can defer to
-        # get_status() rather than showing a false version error.
-        compatible = None
+        # Fail fast if the on-disk binary itself reports a too-old version — no
+        # need to hit the bus, it can only get worse from here.
+        min_tuple = tuple(int(x) for x in MIN_GOVERNOR_VERSION.split("."))
+        if version is not None and not _version_gte(version, min_tuple):
+            return {"version": version, "status": "outdated", "min_version": MIN_GOVERNOR_VERSION, "config_path": GOVERNOR_CONFIG}
+
+        # Binary version looks new enough (or couldn't be parsed) — confirm the
+        # *running* service actually has SetParameters. If it doesn't, the
+        # binary itself is already known to be new enough (checked above), so
+        # the only remaining explanations are: the service's own dbus.enabled
+        # config is off (interface never exposed), or it's still running an
+        # older in-memory process that hasn't been restarted since the binary
+        # was upgraded. Check the config directly to tell those apart instead
+        # of guessing.
+        #
+        # We only report "unknown" when the service is confirmed unreachable
+        # (busctl status fails) — that's the one case where deferring to
+        # get_status()'s diagnosis is safe.
+        if not await _is_governor_available():
+            return {"version": version, "status": "unknown", "min_version": MIN_GOVERNOR_VERSION, "config_path": GOVERNOR_CONFIG}
+
+        confirmed = False
         try:
             proc = await asyncio.create_subprocess_exec(
                 "busctl", "--system", "introspect",
@@ -291,18 +342,31 @@ class Plugin:
                 env=_CLEAN_ENV,
             )
             stdout, _ = await proc.communicate()
-            if proc.returncode == 0:
-                compatible = b"SetParameters" in stdout
-            # non-zero → service not running; leave compatible=None
+            confirmed = proc.returncode == 0 and b"SetParameters" in stdout
         except Exception as e:
             decky.logger.error(f"get_governor_version introspect error: {e}")
 
-        return {"version": version, "compatible": compatible}
+        if confirmed:
+            return {"version": version, "status": "compatible", "min_version": MIN_GOVERNOR_VERSION, "config_path": GOVERNOR_CONFIG}
+
+        # Not confirmed compatible — figure out why. The config file is the
+        # ground truth for dbus.enabled; if we can't even read it, nothing
+        # past this point is trustworthy (get_config_defaults, _derive_notches,
+        # etc. all depend on the same file), so that's a hard stop, not a
+        # guess folded into one of the other statuses.
+        dbus_enabled = _dbus_enabled_in_config()
+        if dbus_enabled is None:
+            status = "config_unreadable"
+        elif dbus_enabled is False:
+            status = "dbus_disabled"
+        else:
+            status = "stale_service"
+
+        return {"version": version, "status": status, "min_version": MIN_GOVERNOR_VERSION, "config_path": GOVERNOR_CONFIG}
 
     async def get_config_defaults(self) -> dict:
         try:
-            with open(GOVERNOR_CONFIG, "rb") as f:
-                config = tomllib.load(f)
+            config = _load_governor_config()
             notches = self._notches if hasattr(self, "_notches") and self._notches else _derive_notches()
             freq_range = config.get("frequency-range") or {}
             load_target = config.get("load-target") or {}
@@ -327,7 +391,23 @@ class Plugin:
             }
 
     async def list_profiles(self) -> dict:
-        return _load_profiles()
+        try:
+            data = _load_profiles()
+            return {"profiles": data.get("profiles", []), "active_id": data.get("active_id"), "corrupt": False}
+        except Exception as e:
+            decky.logger.error(f"list_profiles: profiles.json unreadable: {e}")
+            return {"profiles": [], "active_id": None, "corrupt": True}
+
+    async def reset_profiles(self) -> dict:
+        """Explicitly overwrite an unreadable profiles.json with a fresh,
+        empty one. Only called after the user has confirmed they want to
+        discard whatever's left of the corrupt file."""
+        try:
+            _save_profiles({"profiles": [], "active_id": None})
+            return {"ok": True, "error": None}
+        except Exception as e:
+            decky.logger.error(f"reset_profiles error: {e}")
+            return {"ok": False, "error": str(e)}
 
     async def save_profile(self, profile: dict) -> dict:
         try:
@@ -616,49 +696,55 @@ class Plugin:
             decky.logger.error(f"_main: dependency check failed: {dep_error}")
         else:
             try:
-                self._notches = _derive_notches()
-                decky.logger.info(f"_main: loaded {len(self._notches)} notches: {self._notches}")
-            except FileNotFoundError:
-                decky.logger.info(f"_main: governor config not found at {GOVERNOR_CONFIG}, skipping load")
-            except Exception as e:
-                decky.logger.error(f"_main: failed to load notches: {e}")
-
-            try:
                 available = await _is_governor_available()
                 if not available:
-                    decky.logger.info("_main: governor not available, skipping re-apply")
-                elif not self._notches:
-                    decky.logger.info("_main: no notches loaded, skipping re-apply")
+                    decky.logger.info("_main: governor not available, skipping notch load and re-apply")
                 else:
-                    profiles_data = _load_profiles()
+                    # Derive notches now, before any re-apply below — that call
+                    # sends SetParameters over D-Bus, and if the governor
+                    # persists a live-applied range back into its own config,
+                    # deriving after would read the already-narrowed value and
+                    # defeat the point of caching the original range.
+                    try:
+                        self._notches = _derive_notches()
+                        decky.logger.info(f"_main: loaded {len(self._notches)} notches: {self._notches}")
+                    except FileNotFoundError:
+                        decky.logger.info(f"_main: governor config not found at {GOVERNOR_CONFIG}, skipping load")
+                    except Exception as e:
+                        decky.logger.error(f"_main: failed to load notches: {e}")
 
-                    # Auto-create a Default profile from TOML on first run
-                    if not profiles_data.get("profiles"):
-                        defaults = await self.get_config_defaults()
-                        default_profile = {
-                            "id": str(int(time.time() * 1000)),
-                            "name": "Default",
-                            **defaults,
-                        }
-                        profiles_data["profiles"] = [default_profile]
-                        profiles_data["active_id"] = default_profile["id"]
-                        _save_profiles(profiles_data)
-                        decky.logger.info("_main: created Default profile from TOML config")
-
-                    active_id = profiles_data.get("active_id")
-                    if not active_id:
-                        decky.logger.info("_main: no active profile, skipping re-apply")
+                    if not self._notches:
+                        decky.logger.info("_main: no notches loaded, skipping re-apply")
                     else:
-                        active = next(
-                            (p for p in profiles_data.get("profiles", []) if p["id"] == active_id),
-                            None,
-                        )
-                        if not active:
-                            decky.logger.info("_main: active profile not found in profiles list")
+                        profiles_data = _load_profiles()
+
+                        # Auto-create a Default profile from TOML on first run
+                        if not profiles_data.get("profiles"):
+                            defaults = await self.get_config_defaults()
+                            default_profile = {
+                                "id": str(int(time.time() * 1000)),
+                                "name": "Default",
+                                **defaults,
+                            }
+                            profiles_data["profiles"] = [default_profile]
+                            profiles_data["active_id"] = default_profile["id"]
+                            _save_profiles(profiles_data)
+                            decky.logger.info("_main: created Default profile from TOML config")
+
+                        active_id = profiles_data.get("active_id")
+                        if not active_id:
+                            decky.logger.info("_main: no active profile, skipping re-apply")
                         else:
-                            result = await self._apply_profile(active)
-                            if not result["ok"]:
-                                decky.logger.error(f"_main: failed to re-apply profile: {result['error']}")
+                            active = next(
+                                (p for p in profiles_data.get("profiles", []) if p["id"] == active_id),
+                                None,
+                            )
+                            if not active:
+                                decky.logger.info("_main: active profile not found in profiles list")
+                            else:
+                                result = await self._apply_profile(active)
+                                if not result["ok"]:
+                                    decky.logger.error(f"_main: failed to re-apply profile: {result['error']}")
             except Exception as e:
                 decky.logger.error(f"_main error: {e}")
 

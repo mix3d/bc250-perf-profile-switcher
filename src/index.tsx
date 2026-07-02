@@ -75,9 +75,11 @@ const getTelemetry = callable<[], Telemetry>("get_telemetry");
 const getHistory = callable<[], Telemetry[]>("get_history");
 const setHistoryEnabled = callable<[boolean], void>("set_history_enabled");
 const getDebugInfo = callable<[], Record<string, string | number | null>>("get_debug_info");
-const getGovernorVersion = callable<[], { version: string | null; compatible: boolean | null }>("get_governor_version");
+type GovernorStatus = "compatible" | "not_installed" | "outdated" | "stale_service" | "dbus_disabled" | "config_unreadable" | "unknown";
+const getGovernorVersion = callable<[], { version: string | null; status: GovernorStatus; min_version: string; config_path: string }>("get_governor_version");
 const getConfigDefaults = callable<[], ConfigDefaults>("get_config_defaults");
-const listProfiles = callable<[], { profiles: Profile[]; active_id: string | null }>("list_profiles");
+const listProfiles = callable<[], { profiles: Profile[]; active_id: string | null; corrupt: boolean }>("list_profiles");
+const resetProfiles = callable<[], { ok: boolean; error: string | null }>("reset_profiles");
 const saveProfile = callable<[Profile], { ok: boolean; error: string | null; id: string | null }>("save_profile");
 const deleteProfile = callable<[string], { ok: boolean; error: string | null }>("delete_profile");
 const setActiveProfile = callable<[string], { ok: boolean; error: string | null }>("set_active_profile");
@@ -420,9 +422,11 @@ function Content() {
   );
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
-  const [versionInfo, setVersionInfo] = useState<{ version: string | null; compatible: boolean | null } | null>(null);
+  const [versionInfo, setVersionInfo] = useState<{ version: string | null; status: GovernorStatus; min_version: string; config_path: string } | null>(null);
   const [latestVersion, setLatestVersion] = useState<string | null>(null);
   const [updating, setUpdating] = useState(false);
+  const [profilesCorrupt, setProfilesCorrupt] = useState(false);
+  const [resettingProfiles, setResettingProfiles] = useState(false);
 
   const updateAvailable = latestVersion !== null && latestVersion !== `v${__PLUGIN_VERSION__}`;
 
@@ -577,9 +581,17 @@ function Content() {
 
       setVersionInfo(verInfo);
 
-      // compatible === false means service is running but lacks SetParameters (old governor)
-      // compatible === null means service not running — defer to getStatus() for the right error
-      if (verInfo.compatible === false) {
+      // "unknown" means the service isn't running — defer to getStatus() for the right error.
+      // Any other non-"compatible" status is a real version gate, so stop loading and show it.
+      if (verInfo.status !== "compatible" && verInfo.status !== "unknown") {
+        setLoading(false);
+        return;
+      }
+
+      // profiles.json couldn't be parsed — don't touch it until the user
+      // explicitly chooses to reset it, so any recoverable data stays intact.
+      if (profilesData.corrupt) {
+        setProfilesCorrupt(true);
         setLoading(false);
         return;
       }
@@ -668,15 +680,55 @@ function Content() {
     );
   }
 
-  // Version gate — blocks all UI only when service is running but SetParameters is absent
-  if (versionInfo && versionInfo.compatible === false) {
-    const msg = versionInfo.version == null
+  // Version gate — blocks all UI unless the governor is installed and compatible
+  if (versionInfo && versionInfo.status !== "compatible" && versionInfo.status !== "unknown") {
+    const msg = versionInfo.status === "not_installed"
       ? "cyan-skillfish-governor-smu not found — install the governor to use this plugin."
-      : `Governor v${versionInfo.version} is too old — v0.4.11+ required. Please update cyan-skillfish-governor-smu.`;
+      : versionInfo.status === "stale_service"
+      ? `Governor v${versionInfo.version} is installed but the running service is still on an older version — restart cyan-skillfish-governor-smu to apply it.`
+      : versionInfo.status === "dbus_disabled"
+      ? "Governor D-Bus interface is disabled. Set dbus.enabled = true in the governor config and restart cyan-skillfish-governor-smu."
+      : versionInfo.status === "config_unreadable"
+      ? `Could not read the governor config at ${versionInfo.config_path} — check that it exists and is readable. Nothing in this plugin can work reliably until that's fixed.`
+      : `Governor v${versionInfo.version} is too old — v${versionInfo.min_version}+ required. Please update cyan-skillfish-governor-smu.`;
     return (
       <PanelSection title="Governor Required">
         <PanelSectionRow>
           <div style={{ color: "var(--field-negative-color, #e05c5c)" }}>{msg}</div>
+        </PanelSectionRow>
+      </PanelSection>
+    );
+  }
+
+  // Profiles gate — profiles.json exists but couldn't be parsed. Don't touch
+  // it (save/delete/etc. would silently overwrite whatever's recoverable)
+  // until the user explicitly confirms they want to discard it.
+  if (profilesCorrupt) {
+    return (
+      <PanelSection title="Profiles File Corrupted">
+        <PanelSectionRow>
+          <div style={{ color: "var(--field-negative-color, #e05c5c)" }}>
+            Your saved profiles file could not be read and may be corrupted. Resetting will discard any
+            existing profiles. Leaving it as-is stops the plugin here so nothing gets overwritten.
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <DialogButton
+            disabled={resettingProfiles}
+            onClick={async () => {
+              setResettingProfiles(true);
+              const result = await resetProfiles();
+              setResettingProfiles(false);
+              if (!result.ok) {
+                toaster.toast({ title: "BC250 Profiles", body: result.error ?? "Failed to reset profiles" });
+                return;
+              }
+              setProfilesCorrupt(false);
+              await refreshProfiles();
+            }}
+          >
+            {resettingProfiles ? "Resetting…" : "Reset Profiles (discard corrupted data)"}
+          </DialogButton>
         </PanelSectionRow>
       </PanelSection>
     );
