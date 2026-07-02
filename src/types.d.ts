@@ -1,3 +1,5 @@
+declare const __PLUGIN_VERSION__: string;
+
 declare module "*.svg" {
   const content: string;
   export default content;

@@ -1,11 +1,11 @@
 {
   "name": "BC-250 Performance",
   "author": "mix3d",
-  "flags": [],
+  "flags": ["_root"],
   "api_version": 1,
   "publish": {
     "tags": ["bc250", "performance", "gpu"],
-    "description": "Set the BC-250 GPU max clock live via a notched slider, driving the cyan-skillfish governor.",
+    "description": "Set the BC-250 GPU max clock live via a slider and custom profiles, driving the cyan-skillfish-smu governor.",
     "image": "https://github.com/mix3d/bc250-perf-profile-switcher/raw/main/assets/screenshot-text.png"
   }
 }

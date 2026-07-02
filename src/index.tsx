@@ -19,9 +19,9 @@ import {
   showModal,
   staticClasses,
 } from "@decky/ui";
-import { callable, definePlugin, toaster } from "@decky/api";
+import { callable, definePlugin, fetchNoCors, toaster } from "@decky/api";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { FaBolt, FaPencilAlt, FaSave, FaTrash } from "react-icons/fa";
+import { FaBolt, FaExclamationTriangle, FaPencilAlt, FaSave, FaTrash } from "react-icons/fa";
 
 type DisplayMode = "off" | "minimal" | "histogram";
 
@@ -81,6 +81,7 @@ const listProfiles = callable<[], { profiles: Profile[]; active_id: string | nul
 const saveProfile = callable<[Profile], { ok: boolean; error: string | null; id: string | null }>("save_profile");
 const deleteProfile = callable<[string], { ok: boolean; error: string | null }>("delete_profile");
 const setActiveProfile = callable<[string], { ok: boolean; error: string | null }>("set_active_profile");
+const updatePlugin = callable<[], { started: boolean; error?: string }>("update_plugin");
 
 const rowHead: React.CSSProperties = {
   fontSize: "0.75em",
@@ -420,6 +421,27 @@ function Content() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
   const [versionInfo, setVersionInfo] = useState<{ version: string | null; compatible: boolean | null } | null>(null);
+  const [latestVersion, setLatestVersion] = useState<string | null>(null);
+  const [updating, setUpdating] = useState(false);
+
+  const updateAvailable = latestVersion !== null && latestVersion !== `v${__PLUGIN_VERSION__}`;
+
+  const handleUpdate = async () => {
+    setUpdating(true);
+    try {
+      const result = await updatePlugin();
+      if (result.started) {
+        toaster.toast({ title: "BC250 Profiles", body: "Updating — the Quick Access menu will reload shortly." });
+      } else {
+        toaster.toast({ title: "BC250 Profiles", body: result.error ?? "Failed to start update" });
+        setUpdating(false);
+      }
+    } catch (e) {
+      console.error("[bc250] update_plugin threw:", e);
+      toaster.toast({ title: "BC250 Profiles", body: "Failed to start update" });
+      setUpdating(false);
+    }
+  };
 
   const appliedIndexRef = useRef(0);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -536,6 +558,13 @@ function Content() {
   };
 
   useEffect(() => {
+    fetchNoCors("https://api.github.com/repos/mix3d/bc250-perf-profile-switcher/releases/latest")
+      .then((r) => r.json())
+      .then((data) => { if (data?.tag_name) setLatestVersion(data.tag_name); })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
 
     (async () => {
@@ -616,8 +645,15 @@ function Content() {
         setIndex(appliedIndexRef.current);
       } else {
         appliedIndexRef.current = newIndex;
-        const data = await listProfiles();
-        setProfiles(data.profiles);
+        // Update cap_freq_mhz locally; max_freq_mhz never changes on a cap, and a
+        // full listProfiles() refetch was causing effectiveNotches to recompute incorrectly.
+        setProfiles((prev) =>
+          prev.map((p) =>
+            p.id === activeProfileId
+              ? { ...p, cap_freq_mhz: effectiveNotches[newIndex] }
+              : p
+          )
+        );
       }
     }, 300);
   };
@@ -685,6 +721,27 @@ function Content() {
 
   return (
     <>
+      {updateAvailable && (
+        <div style={{
+          padding: "10px 16px",
+          borderBottom: "1px solid rgba(255,255,255,0.15)",
+          fontSize: "0.9em",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: "8px",
+          color: "rgba(255,255,255,0.85)",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <FaExclamationTriangle style={{ color: "#f5a623", flexShrink: 0 }} />
+            Update available: {latestVersion}
+          </div>
+          <DialogButton disabled={updating} onClick={handleUpdate}>
+            {updating ? "Updating…" : "Update now"}
+          </DialogButton>
+        </div>
+      )}
       <PanelSection title="Profile">
         <PanelSectionRow>
           <div style={{ display: "flex", alignItems: "center", gap: "8px", width: "100%" }}>

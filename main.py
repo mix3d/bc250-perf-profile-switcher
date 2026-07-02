@@ -143,8 +143,10 @@ class Plugin:
                     "current_index": 0,
                 }
 
-            notches = _derive_notches()
-            self._notches = notches
+            # Use the notches cached at startup so that any transient changes
+            # to the governor's live range (e.g. a cap applied last session)
+            # don't truncate the available notch list.
+            notches = self._notches if hasattr(self, "_notches") and self._notches else _derive_notches()
 
             if not notches:
                 return {
@@ -181,6 +183,77 @@ class Plugin:
 
     async def get_debug_info(self) -> dict:
         return await _get_debug_info()
+
+    async def update_plugin(self) -> dict:
+        """Download update-plugin.sh — pinned to the git tag matching the
+        currently-installed plugin version, so we run a script known to be
+        compatible with this release rather than whatever's newest on `main`
+        — and run it detached from this process's cgroup (via systemd-run),
+        since the script itself does `systemctl stop plugin_loader.service`,
+        which would otherwise kill this process (and anything it directly
+        spawned) along with the service.
+
+        Requires the "_root" flag in plugin.json so systemd-run/systemctl work
+        without sudo. TODO: swap for a narrowly-scoped sudoers NOPASSWD rule
+        so the plugin can run unprivileged again.
+        """
+        try:
+            script_path = "/tmp/bc250-update.sh"
+            script_url = (
+                "https://raw.githubusercontent.com/mix3d/bc250-perf-profile-switcher/"
+                f"v{decky.DECKY_PLUGIN_VERSION}/scripts/update-plugin.sh"
+            )
+            plugins_dir = os.path.join(decky.DECKY_HOME, "plugins")
+            decky.logger.info(
+                f"update_plugin: fetching {script_url} -> {script_path}, "
+                f"plugins_dir={plugins_dir}"
+            )
+
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-fsSL", "-o", script_path, script_url,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_CLEAN_ENV,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                decky.logger.error(
+                    f"update_plugin: failed to fetch installer (exit {proc.returncode}): "
+                    f"stdout={stdout} stderr={stderr}"
+                )
+                return {"started": False, "error": "Failed to download installer script"}
+            decky.logger.info(f"update_plugin: fetched updater script to {script_path}")
+
+            os.chmod(script_path, 0o755)
+
+            cmd = [
+                "systemd-run", "--unit=bc250-plugin-update", "--collect",
+                "/bin/bash", script_path, plugins_dir,
+            ]
+            decky.logger.info(f"update_plugin: launching {cmd}")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_CLEAN_ENV,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                decky.logger.error(
+                    f"update_plugin: systemd-run failed (exit {proc.returncode}): "
+                    f"stdout={stdout} stderr={stderr}"
+                )
+                return {"started": False, "error": "Failed to start update"}
+
+            decky.logger.info(
+                f"update_plugin: update running in detached unit bc250-plugin-update "
+                f"({stdout.decode(errors='replace').strip()}); "
+                "see `journalctl -u bc250-plugin-update` for its progress"
+            )
+            return {"started": True}
+        except Exception as e:
+            decky.logger.error(f"update_plugin error: {e}")
+            return {"started": False, "error": str(e)}
 
     async def get_governor_version(self) -> dict:
         bin_path = shutil.which("cyan-skillfish-governor-smu")
