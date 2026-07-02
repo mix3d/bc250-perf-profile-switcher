@@ -19,9 +19,9 @@ import {
   showModal,
   staticClasses,
 } from "@decky/ui";
-import { callable, definePlugin, toaster } from "@decky/api";
+import { callable, definePlugin, fetchNoCors, toaster } from "@decky/api";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { FaBolt, FaPencilAlt, FaSave, FaTrash } from "react-icons/fa";
+import { FaBolt, FaExclamationTriangle, FaPencilAlt, FaSave, FaTrash } from "react-icons/fa";
 
 type DisplayMode = "off" | "minimal" | "histogram";
 
@@ -75,12 +75,26 @@ const getTelemetry = callable<[], Telemetry>("get_telemetry");
 const getHistory = callable<[], Telemetry[]>("get_history");
 const setHistoryEnabled = callable<[boolean], void>("set_history_enabled");
 const getDebugInfo = callable<[], Record<string, string | number | null>>("get_debug_info");
-const getGovernorVersion = callable<[], { version: string | null; compatible: boolean | null }>("get_governor_version");
+type GovernorStatus = "compatible" | "not_installed" | "outdated" | "stale_service" | "dbus_disabled" | "config_unreadable" | "unknown";
+type VersionInfo = { version: string | null; status: GovernorStatus; min_version: string; config_path: string };
+const getGovernorVersion = callable<[], VersionInfo>("get_governor_version");
+
+// Every non-"compatible", non-"unknown" status blocks the UI with its own message —
+// TypeScript enforces that every such status is covered here.
+const GOVERNOR_STATUS_MESSAGES: Record<Exclude<GovernorStatus, "compatible" | "unknown">, (v: VersionInfo) => string> = {
+  not_installed: () => "cyan-skillfish-governor-smu not found — install the governor to use this plugin.",
+  outdated: (v) => `Governor v${v.version} is too old — v${v.min_version}+ required. Please update cyan-skillfish-governor-smu.`,
+  stale_service: (v) => `Governor v${v.version} is installed but the running service is still on an older version — restart cyan-skillfish-governor-smu to apply it.`,
+  dbus_disabled: () => "Governor D-Bus interface is disabled. Set dbus.enabled = true in the governor config and restart cyan-skillfish-governor-smu.",
+  config_unreadable: (v) => `Could not read the governor config at ${v.config_path} — check that it exists and is readable. Nothing in this plugin can work reliably until that's fixed.`,
+};
 const getConfigDefaults = callable<[], ConfigDefaults>("get_config_defaults");
-const listProfiles = callable<[], { profiles: Profile[]; active_id: string | null }>("list_profiles");
+const listProfiles = callable<[], { profiles: Profile[]; active_id: string | null; corrupt: boolean }>("list_profiles");
+const resetProfiles = callable<[], { ok: boolean; error: string | null }>("reset_profiles");
 const saveProfile = callable<[Profile], { ok: boolean; error: string | null; id: string | null }>("save_profile");
 const deleteProfile = callable<[string], { ok: boolean; error: string | null }>("delete_profile");
 const setActiveProfile = callable<[string], { ok: boolean; error: string | null }>("set_active_profile");
+const updatePlugin = callable<[], { started: boolean; error?: string }>("update_plugin");
 
 const rowHead: React.CSSProperties = {
   fontSize: "0.75em",
@@ -173,17 +187,10 @@ interface ProfileEditModalProps {
 }
 
 function ProfileEditModal({ closeModal, profile, notches, defaults, onSave, onDelete }: ProfileEditModalProps) {
-  const fiftyMhzSteps = useMemo(() => {
-    const lo = notches[0] ?? 0;
-    const hi = notches[notches.length - 1] ?? 0;
-    const steps: number[] = [];
-    for (let f = lo; f <= hi; f += 50) steps.push(f);
-    if (steps.length === 0 || steps[steps.length - 1] !== hi) steps.push(hi);
-    return steps;
-  }, [notches]);
-
-  const snapIdx = (mhz: number, freqs: number[]) =>
-    freqs.reduce((best, f, i) => Math.abs(f - mhz) < Math.abs(freqs[best] - mhz) ? i : best, 0);
+  const fiftyMhzSteps = useMemo(
+    () => generate50MhzSteps(notches[0] ?? 0, notches[notches.length - 1] ?? 0),
+    [notches]
+  );
 
   const findNotchIdx = (mhz: number | undefined, fallback: number) => {
     if (mhz == null) return Math.max(0, notches.indexOf(fallback));
@@ -207,8 +214,8 @@ function ProfileEditModal({ closeModal, profile, notches, defaults, onSave, onDe
     const currentMax = activeFreqs[maxFreqIdx];
     const newFreqs = toml ? notches : fiftyMhzSteps;
     setUseTomlSteps(toml);
-    setMinFreqIdx(snapIdx(currentMin, newFreqs));
-    setMaxFreqIdx(snapIdx(currentMax, newFreqs));
+    setMinFreqIdx(snapToEffective(currentMin, newFreqs));
+    setMaxFreqIdx(snapToEffective(currentMax, newFreqs));
   };
   const [loadMin, setLoadMin] = useState(
     Math.round((profile?.load_min ?? defaults?.load_min ?? 0.5) * 100)
@@ -285,7 +292,7 @@ function ProfileEditModal({ closeModal, profile, notches, defaults, onSave, onDe
         </DialogControlsSection>
 
         <DialogControlsSection>
-          <DialogControlsSectionHeader>Frequency</DialogControlsSectionHeader>
+          <DialogControlsSectionHeader>GPU Frequency</DialogControlsSectionHeader>
           <ToggleField
             label="Use TOML safe-point steps"
             checked={useTomlSteps}
@@ -390,10 +397,31 @@ function ProfileEditModal({ closeModal, profile, notches, defaults, onSave, onDe
   );
 }
 
+function parseVersion(v: string): [number, number, number] {
+  const parts = v.replace(/^v/, "").split(".").map((p) => parseInt(p, 10) || 0);
+  return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0];
+}
+
+function isNewerVersion(candidate: string, current: string): boolean {
+  const c = parseVersion(candidate);
+  const cur = parseVersion(current);
+  for (let i = 0; i < 3; i++) {
+    if (c[i] !== cur[i]) return c[i] > cur[i];
+  }
+  return false;
+}
+
 function snapToEffective(freq: number, effective: number[]): number {
   if (!effective.length) return 0;
   return effective.reduce((best, f, i) =>
     Math.abs(f - freq) < Math.abs(effective[best] - freq) ? i : best, 0);
+}
+
+function generate50MhzSteps(lo: number, hi: number): number[] {
+  const steps: number[] = [];
+  for (let f = lo; f <= hi; f += 50) steps.push(f);
+  if (!steps.length || steps[steps.length - 1] !== hi) steps.push(hi);
+  return steps;
 }
 
 function computeEffectiveNotches(profile: Profile | null, allNotches: number[]): number[] {
@@ -402,10 +430,7 @@ function computeEffectiveNotches(profile: Profile | null, allNotches: number[]):
   if (use_toml_steps !== false) {
     return allNotches.filter((f) => f >= min_freq_mhz && f <= max_freq_mhz);
   }
-  const steps: number[] = [];
-  for (let f = min_freq_mhz; f <= max_freq_mhz; f += 50) steps.push(f);
-  if (!steps.length || steps[steps.length - 1] !== max_freq_mhz) steps.push(max_freq_mhz);
-  return steps;
+  return generate50MhzSteps(min_freq_mhz, max_freq_mhz);
 }
 
 function Content() {
@@ -419,7 +444,30 @@ function Content() {
   );
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
-  const [versionInfo, setVersionInfo] = useState<{ version: string | null; compatible: boolean | null } | null>(null);
+  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
+  const [latestVersion, setLatestVersion] = useState<string | null>(null);
+  const [updating, setUpdating] = useState(false);
+  const [profilesCorrupt, setProfilesCorrupt] = useState(false);
+  const [resettingProfiles, setResettingProfiles] = useState(false);
+
+  const updateAvailable = latestVersion !== null && isNewerVersion(latestVersion, __PLUGIN_VERSION__);
+
+  const handleUpdate = async () => {
+    setUpdating(true);
+    try {
+      const result = await updatePlugin();
+      if (result.started) {
+        toaster.toast({ title: "BC250 Profiles", body: "Updating — the Quick Access menu will reload shortly." });
+      } else {
+        toaster.toast({ title: "BC250 Profiles", body: result.error ?? "Failed to start update" });
+        setUpdating(false);
+      }
+    } catch (e) {
+      console.error("[bc250] update_plugin threw:", e);
+      toaster.toast({ title: "BC250 Profiles", body: "Failed to start update" });
+      setUpdating(false);
+    }
+  };
 
   const appliedIndexRef = useRef(0);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -536,6 +584,13 @@ function Content() {
   };
 
   useEffect(() => {
+    fetchNoCors("https://api.github.com/repos/mix3d/bc250-perf-profile-switcher/releases/latest")
+      .then((r) => r.json())
+      .then((data) => { if (data?.tag_name) setLatestVersion(data.tag_name); })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
 
     (async () => {
@@ -548,9 +603,17 @@ function Content() {
 
       setVersionInfo(verInfo);
 
-      // compatible === false means service is running but lacks SetParameters (old governor)
-      // compatible === null means service not running — defer to getStatus() for the right error
-      if (verInfo.compatible === false) {
+      // "unknown" means the service isn't running — defer to getStatus() for the right error.
+      // Any other non-"compatible" status is a real version gate, so stop loading and show it.
+      if (verInfo.status !== "compatible" && verInfo.status !== "unknown") {
+        setLoading(false);
+        return;
+      }
+
+      // profiles.json couldn't be parsed — don't touch it until the user
+      // explicitly chooses to reset it, so any recoverable data stays intact.
+      if (profilesData.corrupt) {
+        setProfilesCorrupt(true);
         setLoading(false);
         return;
       }
@@ -616,8 +679,15 @@ function Content() {
         setIndex(appliedIndexRef.current);
       } else {
         appliedIndexRef.current = newIndex;
-        const data = await listProfiles();
-        setProfiles(data.profiles);
+        // Update cap_freq_mhz locally; max_freq_mhz never changes on a cap, and a
+        // full listProfiles() refetch was causing effectiveNotches to recompute incorrectly.
+        setProfiles((prev) =>
+          prev.map((p) =>
+            p.id === activeProfileId
+              ? { ...p, cap_freq_mhz: effectiveNotches[newIndex] }
+              : p
+          )
+        );
       }
     }, 300);
   };
@@ -632,15 +702,47 @@ function Content() {
     );
   }
 
-  // Version gate — blocks all UI only when service is running but SetParameters is absent
-  if (versionInfo && versionInfo.compatible === false) {
-    const msg = versionInfo.version == null
-      ? "cyan-skillfish-governor-smu not found — install the governor to use this plugin."
-      : `Governor v${versionInfo.version} is too old — v0.4.11+ required. Please update cyan-skillfish-governor-smu.`;
+  // Version gate — blocks all UI unless the governor is installed and compatible
+  if (versionInfo && versionInfo.status !== "compatible" && versionInfo.status !== "unknown") {
+    const msg = GOVERNOR_STATUS_MESSAGES[versionInfo.status](versionInfo);
     return (
       <PanelSection title="Governor Required">
         <PanelSectionRow>
           <div style={{ color: "var(--field-negative-color, #e05c5c)" }}>{msg}</div>
+        </PanelSectionRow>
+      </PanelSection>
+    );
+  }
+
+  // Profiles gate — profiles.json exists but couldn't be parsed. Don't touch
+  // it (save/delete/etc. would silently overwrite whatever's recoverable)
+  // until the user explicitly confirms they want to discard it.
+  if (profilesCorrupt) {
+    return (
+      <PanelSection title="Profiles File Corrupted">
+        <PanelSectionRow>
+          <div style={{ color: "var(--field-negative-color, #e05c5c)" }}>
+            Your saved profiles file could not be read and may be corrupted. Resetting will discard any
+            existing profiles. Leaving it as-is stops the plugin here so nothing gets overwritten.
+          </div>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <DialogButton
+            disabled={resettingProfiles}
+            onClick={async () => {
+              setResettingProfiles(true);
+              const result = await resetProfiles();
+              setResettingProfiles(false);
+              if (!result.ok) {
+                toaster.toast({ title: "BC250 Profiles", body: result.error ?? "Failed to reset profiles" });
+                return;
+              }
+              setProfilesCorrupt(false);
+              await refreshProfiles();
+            }}
+          >
+            {resettingProfiles ? "Resetting…" : "Reset Profiles (discard corrupted data)"}
+          </DialogButton>
         </PanelSectionRow>
       </PanelSection>
     );
@@ -685,6 +787,27 @@ function Content() {
 
   return (
     <>
+      {updateAvailable && (
+        <div style={{
+          padding: "10px 16px",
+          borderBottom: "1px solid rgba(255,255,255,0.15)",
+          fontSize: "0.9em",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: "8px",
+          color: "rgba(255,255,255,0.85)",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <FaExclamationTriangle style={{ color: "#f5a623", flexShrink: 0 }} />
+            Update available: {latestVersion}
+          </div>
+          <DialogButton disabled={updating} onClick={handleUpdate}>
+            {updating ? "Updating…" : "Update now"}
+          </DialogButton>
+        </div>
+      )}
       <PanelSection title="Profile">
         <PanelSectionRow>
           <div style={{ display: "flex", alignItems: "center", gap: "8px", width: "100%" }}>
